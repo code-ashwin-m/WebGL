@@ -74,7 +74,7 @@ function getEllipseHandlePositions() {
       rotate: rot(0, -(maskRy + ROTATE_OFFSET_PX * pixel))
   };
 }
-  
+
 function isInsideCenterHandle(px, py) {
     const world = screenToWorld(px, py);
     const dx = world.x - maskX;
@@ -193,96 +193,68 @@ void main() {
 const fsMaskSource = `
 precision mediump float;
 
-uniform vec2  uCenter;
-uniform float uRx;            // ellipse radius X (world units)
-uniform float uRy;            // ellipse radius Y (world units)
-uniform float uRotation;      // radians
+uniform vec2 uCenter;     // world pos
+uniform float uRx;        // ellipse radius X (world)
+uniform float uRy;        // ellipse radius Y (world)
+uniform float uRotation;  // radians
+uniform float uThicknessPx; // world thickness
+uniform float uFeatherPx;   // softness
 
-// Thickness controls *in screen pixels*
-uniform float uThicknessPx;   // white ring thickness (px)
-uniform float uFeatherPx;     // AA softness (px)
-uniform float uOutlinePx;     // black outline width (px)
-
-// Conversion from pixel → world units
-uniform float uPixelSize;
+uniform float uOutlinePx; // 1px black outline width in SCREEN pixels
+uniform float uPixelSize; // world units per screen pixel (1/zoom)
 
 varying vec2 v_worldPos;
 
-// ------------------------------------------------------------
-// Helper: rotate point into ellipse-local coordinates
-// ------------------------------------------------------------
-vec2 rotate(vec2 p, float a) {
-    float c = cos(a);
-    float s = sin(a);
-    return vec2(p.x*c + p.y*s, -p.x*s + p.y*c);
-}
-
-// ------------------------------------------------------------
-// Signed Distance Function for ellipse
-// Returns: 0 at ellipse boundary
-//         <0 inside
-//         >0 outside
-// ------------------------------------------------------------
-float ellipseSDF(vec2 p, vec2 center, float rx, float ry, float rot) {
+float ellipseDist(vec2 p, vec2 center, float rx, float ry, float rotation) {
+    // translate
     vec2 d = p - center;
-    vec2 r = rotate(d, rot);
 
-    float nx = r.x / rx;
-    float ny = r.y / ry;
+    // rotate by -rotation
+    float c = cos(rotation);
+    float s = sin(rotation);
+    vec2 r = vec2(
+        d.x * c + d.y * s,
+       -d.x * s + d.y * c
+    );
 
-    return length(vec2(nx, ny)) - 1.0;
+    // normalized ellipse distance
+    return length(vec2(r.x / rx, r.y / ry));
 }
 
-// ------------------------------------------------------------
-// SDF Gradient Magnitude
-// Needed to correct thickness so it stays constant in pixels.
-// THIS is what prevents stretching at wide ellipses.
-// ------------------------------------------------------------
-float ellipseGradScale(vec2 p, vec2 center, float rx, float ry, float rot) {
-    vec2 d = p - center;
-    vec2 r = rotate(d, rot);
-
-    // gradient of normalized ellipse distance
-    float gx = r.x / (rx * rx);
-    float gy = r.y / (ry * ry);
-
-    return sqrt(gx*gx + gy*gy);
-}
-
-// ------------------------------------------------------------
-// Main render
-// ------------------------------------------------------------
 void main() {
+    float d = ellipseDist(v_worldPos, uCenter, uRx, uRy, uRotation);
+    
+    // Convert world thickness to normalized ellipse distance:
+    float normThickness = uThicknessPx / min(uRx, uRy);
+    float normFeather   = uFeatherPx   / min(uRx, uRy);
 
-    float d = ellipseSDF(v_worldPos, uCenter, uRx, uRy, uRotation);
+    // ---- Main white ring ----
+    float inner = 1.0 - normThickness;
+    float outer = 1.0 + normThickness;
+    
+    float whiteRing =
+        smoothstep(inner - normFeather, inner + normFeather, d) *
+        (1.0 - smoothstep(outer - normFeather, outer + normFeather, d));
+    
+    // ---- Outer 1px black outline ----
+    float outlineInner = outer;
+    float outlineOuter = outer + (uOutlinePx * uPixelSize) / min(uRx, uRy);
 
-    // Pixel → world unit conversion using gradient
-    float px   = uPixelSize;
-    float grad = ellipseGradScale(v_worldPos, uCenter, uRx, uRy, uRotation);
+    float blackRing =
+        smoothstep(outlineInner - normFeather, outlineInner + normFeather, d) *
+        (1.0 - smoothstep(outlineOuter - normFeather, outlineOuter + normFeather, d));
 
-    float thick    = uThicknessPx * px / grad;
-    float feather  = uFeatherPx   * px / grad;
-    float outline  = uOutlinePx   * px / grad;
+    // Composite: black ring behind white ring
+    float finalAlpha = max(whiteRing, blackRing);
 
-    // White border region
-    float whiteInner = -thick;
-    float whiteOuter = +thick;
+    if (finalAlpha < 0.01) discard;
 
-    float white = smoothstep(whiteInner - feather, whiteInner + feather, -d) *
-                 (1.0 - smoothstep(whiteOuter - feather, whiteOuter + feather, -d));
+    vec3 color =
+        (blackRing > whiteRing) ?
+        vec3(0.0) :          // black outer border
+        vec3(1.0);           // white inner ring
 
-    // Black outline region (outside white)
-    float black = smoothstep(whiteOuter - feather, whiteOuter + feather, -d) *
-                 (1.0 - smoothstep(whiteOuter + outline - feather,
-                                   whiteOuter + outline + feather, -d));
-
-    float alpha = max(white, black);
-
-    if (alpha < 0.01)
-        discard;
-
-    vec3 color = (black > white) ? vec3(0.0) : vec3(1.0);
-    gl_FragColor = vec4(color, alpha);
+    gl_FragColor = vec4(color, finalAlpha);
 }
 `;
 
@@ -297,6 +269,7 @@ function compileShader(type, source) {
     gl.compileShader(shader);
     if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
         console.error(gl.getShaderInfoLog(shader));
+        alert(gl.getShaderInfoLog(shader));
         return null;
     }
     return shader;
