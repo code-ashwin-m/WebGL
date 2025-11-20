@@ -320,6 +320,38 @@ canvas.addEventListener("touchend", e => {
   }
 });
   
+// ---------------------------------------------------------
+// Mouse support (optional)
+// ---------------------------------------------------------
+let mouseDown = false;
+  
+canvas.addEventListener("mousedown", e => {
+  mouseDown = true;
+  lastX = e.clientX;
+  lastY = e.clientY;
+});
+canvas.addEventListener("mouseup", () => mouseDown = false);
+canvas.addEventListener("mousemove", e => {
+  if (!mouseDown) return;
+  let dx = e.clientX - lastX;
+  let dy = e.clientY - lastY;
+
+  camX -= dx * (1 / zoom);
+  camY += dy * (1 / zoom);
+
+  lastX = e.clientX;
+  lastY = e.clientY;
+
+  draw();
+});
+canvas.addEventListener("wheel", e => {
+  const z = 1.1;
+  zoom *= (e.deltaY < 0 ? z : 1/z);
+  zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom));
+  draw();
+});
+
+  
 function init() {
     resetViewToFit();
     draw();           // ✓ draw first frame
