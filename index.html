@@ -20,7 +20,7 @@ let zoom = 1;
 
 // --- Zoom limits ---
 const MIN_ZOOM = 0.2;
-const MAX_ZOOM = 10;
+const MAX_ZOOM = 5;
   
 // Touch state
 let lastX = 0, lastY = 0;
@@ -79,23 +79,59 @@ function ortho(left, right, bottom, top, near, far) {
   
 // -------------------- SHADERS --------------------
 const vsSource = `
-attribute vec2 aPos;
-attribute vec2 aTex;
+attribute vec2 a_Pos;
+attribute vec2 a_Tex;
 uniform mat4 u_proj;
-varying vec2 vTex;
+varying vec2 v_Tex;
 
 void main() {
-    gl_Position = u_proj * vec4(aPos, 0.0, 1.0);
-    vTex = aTex;
+    gl_Position = u_proj * vec4(a_Pos, 0.0, 1.0);
+    v_Tex = a_Tex;
 }
 `;
 
 const fsSource = `
 precision mediump float;
-varying vec2 vTex;
-uniform sampler2D uTex;
+varying vec2 v_Tex;
+uniform sampler2D u_Tex;
 void main() {
-    gl_FragColor = texture2D(uTex, vTex);
+    gl_FragColor = texture2D(u_Tex, v_Tex);
+}
+`;
+
+const vsMaskSource = `
+attribute vec2 a_Pos;
+uniform mat4 u_proj;
+varying vec2 v_worldPos;
+void main() {
+    v_worldPos = a_Pos;
+    gl_Position = u_proj * vec4(a_Pos, 0.0, 1.0);
+}
+`;
+
+const fsMaskSource = `
+precision mediump float;
+
+uniform vec2 uCenter;   // pixel position of handler
+uniform float uRadius;  // pixel radius
+uniform float uThickness;
+uniform float uFeather; 
+
+varying vec2 v_worldPos;
+
+void main() {
+    float d = distance(v_worldPos, uCenter);
+
+    float inner = uRadius - uThickness;
+    float outer = uRadius + uThickness;
+
+    // The ring mask (0 outside, 1 inside)
+    float ring = smoothstep(inner - uFeather, inner + uFeather, d) *
+                 (1.0 - smoothstep(outer - uFeather, outer + uFeather, d));
+
+    if (ring < 0.01) discard;
+
+    gl_FragColor = vec4(1.0, 0.0, 1.0, ring);
 }
 `;
 
@@ -122,10 +158,58 @@ const program = gl.createProgram();
 gl.attachShader(program, vs);
 gl.attachShader(program, fs);
 gl.linkProgram(program);
-gl.useProgram(program);
+  
+const vsMask = compileShader(gl.VERTEX_SHADER, vsMaskSource);
+const fsMask = compileShader(gl.FRAGMENT_SHADER, fsMaskSource);
 
-const u_proj = gl.getUniformLocation(program, "u_proj");
- 
+const maskProgram = gl.createProgram();
+gl.attachShader(maskProgram, vsMask);
+gl.attachShader(maskProgram, fsMask);
+gl.linkProgram(maskProgram);
+
+const aPos = gl.getAttribLocation(program, "a_Pos");
+const aTex = gl.getAttribLocation(program, "a_Tex");
+const uTex = gl.getUniformLocation(program, "u_Tex");
+const uProj = gl.getUniformLocation(program, "u_proj");
+
+const aMaskPos = gl.getAttribLocation(maskProgram, "a_Pos");
+const uMaskProj = gl.getUniformLocation(maskProgram, "u_proj");
+const uMaskCenter = gl.getUniformLocation(maskProgram, "uCenter");
+const uMaskRadius = gl.getUniformLocation(maskProgram, "uRadius");
+const uMaskThickness = gl.getUniformLocation(maskProgram, "uThickness");  
+const uMaskFeather = gl.getUniformLocation(maskProgram, "uFeather");
+  
+function createScreenBuffer(){
+  //gl.viewport(0, 0, canvas.width, canvas.height);
+  
+  const screenVertices = new Float32Array([
+    //X,   Y
+    0,   imgHeight,  // bottom-left
+    imgWidth, imgHeight,  // bottom-right
+    imgWidth, 0,              // top-right
+    0,   0,              // top-left
+  ]);
+  
+  const screenIndices = new Uint16Array([
+    3, 2, 0,
+    0, 1, 2
+  ]);
+  
+  // ---- VBO ----
+  const screenBuffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, screenBuffer);
+  gl.bufferData(gl.ARRAY_BUFFER, screenVertices, gl.STATIC_DRAW);
+  
+  // ---- EBO (Index Buffer) ----
+  const screenIBO = gl.createBuffer();
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, screenIBO);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, screenIndices, gl.STATIC_DRAW);
+
+  gl.enableVertexAttribArray(aMaskPos);
+  gl.vertexAttribPointer(aMaskPos, 2, gl.FLOAT, false, 16, 0);
+
+}
+
 function createImageBuffer(){
   // -------------------- RECTANGLE GEOMETRY --------------------
   // Full-screen rectangle (-1 to +1)
@@ -152,10 +236,6 @@ function createImageBuffer(){
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
 
-  const aPos = gl.getAttribLocation(program, "aPos");
-  const aTex = gl.getAttribLocation(program, "aTex");
-  const uTex = gl.getUniformLocation(program, "uTex");
-  
   gl.enableVertexAttribArray(aPos);
   gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 16, 0);
 
@@ -182,12 +262,13 @@ function loadImageToTexture(image){
 }
 // -------------------- LOAD IMAGE --------------------
 const image = new Image();
-image.src = "http://192.168.1.35:8080/img.jpg";  // ← your image
+image.src = "http://192.168.1.35:8080/img1.jpg";  // ← your image
 image.onload = () => {
     console.log("IMAGE LOADED");
     imgHeight = image.height;
     imgWidth = image.width;
-  
+    
+    createScreenBuffer();
     createImageBuffer();
     loadImageToTexture(image);
 };
@@ -212,6 +293,28 @@ function resetViewToFit() {
   camY = (imgHeight - viewH) / 2;
 }
 
+function renderMaskHandles(){
+  let w = canvas.width / zoom;
+  let h = canvas.height / zoom;
+
+  let left = camX;
+  let right = camX + w;
+  let bottom = camY;
+  let top = camY + h;
+    
+  gl.useProgram(maskProgram);
+  
+  gl.uniform2f(uMaskCenter, 250, 250);
+  gl.uniform1f(uMaskRadius, 100.0);
+  gl.uniform1f(uMaskThickness, 2.0/zoom);
+  gl.uniform1f(uMaskFeather, 0.2); // Try 1→3 for smoother edges
+  
+  const maskProj = ortho(left, right, bottom, top, -1, 1);
+  gl.uniformMatrix4fv(uMaskProj, false, maskProj);
+  
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
 // -------------------- DRAW --------------------
 function draw() {
     canvas.width = canvas.clientWidth;
@@ -225,16 +328,21 @@ function draw() {
     let right = camX + w;
     let bottom = camY;
     let top = camY + h;
-  
+    
+    gl.useProgram(program);
     const proj = ortho(left, right, bottom, top, -1, 1);
-    gl.uniformMatrix4fv(u_proj, false, proj);
+    gl.uniformMatrix4fv(uProj, false, proj);
   
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-
-    //gl.drawArrays(gl.TRIANGLE_STRIP, 0, 6);
+  
+    //Render Image
+    gl.disable(gl.GL_BLEND);
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-    console.log("draw");
+    
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    renderMaskHandles();
 }
 
 // ---------------------------------------------------------
