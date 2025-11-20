@@ -32,6 +32,7 @@ let isTouching = false;
 // Image state
 let imgWidth = 1, imgHeight = 1;
 
+let maskCurrent = null;
 let maskX = 250;
 let maskY = 250;
 let maskRx = 150;   // ellipse radius X
@@ -50,15 +51,47 @@ const ROTATE_OFFSET_PX = 40;     // rotate handle offset above top
 let activeHandle = null;
 let rotateStartAngle = 0;
 let rotateStartRot = 0;
+
+class Mask {
+    constructor(id, type = "circle") {
+        this.id = id;              // Unique identifier
+        this.type = type;          // "circle" or "ellipse"
+        this.center = { x: 250, y: 250 };
+        this.rx = 150; this.ry = 100; // For ellipse
+        this.rotation = 0;         // Rotation in degrees (for ellipse)
+        this.selected = false;     // If this mask is active/selected
+        this.outline = false;
+    }
+}
+
+let masks = [];
+let nextMaskId = 1; // To assign unique IDs
+
+function addMask(type = "circle") {
+    const mask = new Mask(nextMaskId++, type);
+    masks.push(mask);
+    return mask;
+}
+
+function removeMask(id) {
+    masks = masks.filter(mask => mask.id !== id);
+}
+
+function selectMask(id) {
+    masks.forEach(mask => mask.selected = (mask.id === id));
+}
+
+addMask();
+addMask();
   
-function getEllipseHandlePositions() {
-  const c = Math.cos(maskRot);
-  const s = Math.sin(maskRot);
+function getEllipseHandlePositions(mask) {
+  const c = Math.cos(mask.rotation);
+  const s = Math.sin(mask.rotation);
     
   function rot(x, y) {
     return {
-      x: maskX + (x * c - y * s),
-      y: maskY + (x * s + y * c)
+      x: mask.center.x + (x * c - y * s),
+      y: mask.center.y + (x * s + y * c)
     };
   }
     
@@ -67,11 +100,11 @@ function getEllipseHandlePositions() {
 
   return {
       center: rot(0, 0),
-      right:  rot(maskRx, 0),
-      left:   rot(-maskRx, 0),
-      top:    rot(0, maskRy),
-      bottom: rot(0, -maskRy),
-      rotate: rot(0, -(maskRy + ROTATE_OFFSET_PX * pixel))
+      right:  rot(mask.rx, 0),
+      left:   rot(-mask.rx, 0),
+      top:    rot(0, mask.ry),
+      bottom: rot(0, -mask.ry),
+      rotate: rot(0, -(mask.ry + ROTATE_OFFSET_PX * pixel))
   };
 }
 
@@ -91,27 +124,28 @@ function isInsideHandle(px, py, hx, hy) {
 }
 
 function hitResizeOrRotate(px, py) {
-    const h = getEllipseHandlePositions();
+  for (let mask of masks) {
+    const h = getEllipseHandlePositions(mask);
 
     if (isInsideHandle(px, py, h.center.x, h.center.y))
-        return { type: "center" };
+        return { type: "center", mask: mask };
 
     if (isInsideHandle(px, py, h.right.x, h.right.y))
-        return { type: "resize-right" };
+        return { type: "resize-right", mask: mask };
 
     if (isInsideHandle(px, py, h.left.x, h.left.y))
-        return { type: "resize-left" };
+        return { type: "resize-left", mask: mask };
 
     if (isInsideHandle(px, py, h.top.x, h.top.y))
-        return { type: "resize-top" };
+        return { type: "resize-top", mask: mask };
 
     if (isInsideHandle(px, py, h.bottom.x, h.bottom.y))
-        return { type: "resize-bottom" };
+        return { type: "resize-bottom", mask: mask };
 
     if (isInsideHandle(px, py, h.rotate.x, h.rotate.y))
-        return { type: "rotate" };
-
-    return null;
+        return { type: "rotate", mask: mask };
+  };
+  return null;
 }
   
 function midpoint(t1, t2) {
@@ -421,13 +455,13 @@ function resetViewToFit() {
   camY = (imgHeight - viewH) / 2;
 }
 
-function renderMaskSelection(centerX, centerY){
+function renderMaskSelection(mask){
   gl.useProgram(maskProgram);
   
-  gl.uniform2f(uMaskCenter, centerX, centerY);
-  gl.uniform1f(uMaskRx, maskRx);
-  gl.uniform1f(uMaskRy, maskRy);
-  gl.uniform1f(uMaskRotation, maskRot);
+  gl.uniform2f(uMaskCenter, mask.center.x, mask.center.y);
+  gl.uniform1f(uMaskRx, mask.rx);
+  gl.uniform1f(uMaskRy, mask.ry);
+  gl.uniform1f(uMaskRotation, mask.rotation);
   gl.uniform1f(uMaskThicknessPx, 1.0/zoom);
   gl.uniform1f(uMaskFeatherPx, 0.2); // Try 1→3 for smoother edges
   // black outline stays exactly 1px on screen
@@ -468,37 +502,39 @@ function renderMaskCenterHandles() {
   const maskProj = ortho(left, right, bottom, top, -1, 1);
   gl.uniformMatrix4fv(uMaskProj, false, maskProj);
   
-  // A small circle (white)
-  gl.uniform2f(uMaskCenter, maskX, maskY);
+  masks.forEach(mask => {
+    // A small circle (white)
+    gl.uniform2f(uMaskCenter, mask.center.x, mask.center.y);
 
-  // Screen-pixel-constant radius
-  const handleRadiusPx = 12; // 12px diameter
-  const rad = HANDLE_PX / zoom;
-  const thick = (HANDLE_PX * 0.6) / zoom;
+    // Screen-pixel-constant radius
+    const handleRadiusPx = 12; // 12px diameter
+    const rad = HANDLE_PX / zoom;
+    const thick = (HANDLE_PX * 0.6) / zoom;
   
-  gl.uniform1f(uMaskRx, rad);
-  gl.uniform1f(uMaskRy, rad);
-  gl.uniform1f(uMaskThicknessPx, thick);
-  gl.uniform1f(uMaskFeatherPx, 0.7);
-  gl.uniform1f(uMaskOutlinePx, 1.0);
-  gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
+    gl.uniform1f(uMaskRx, rad);
+    gl.uniform1f(uMaskRy, rad);
+    gl.uniform1f(uMaskThicknessPx, thick);
+    gl.uniform1f(uMaskFeatherPx, 0.7);
+    gl.uniform1f(uMaskOutlinePx, 1.0);
+    gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
 
-  // Draw on same quad
-  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    // Draw on same quad
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
 
-  if (maskIsSelected){
-    renderMaskSelection(maskX, maskY);
+    if (mask.selected && mask.outline){
+      renderMaskSelection(mask);
 
-    const handle = getEllipseHandlePositions();
-    // resize handles
-    renderHandleCircle(handle.right.x, handle.right.y);
-    renderHandleCircle(handle.left.x, handle.left.y);
-    renderHandleCircle(handle.top.x, handle.top.y);
-    renderHandleCircle(handle.bottom.x, handle.bottom.y);
+      const handle = getEllipseHandlePositions(mask);
+      // resize handles
+      renderHandleCircle(handle.right.x, handle.right.y);
+      renderHandleCircle(handle.left.x, handle.left.y);
+      renderHandleCircle(handle.top.x, handle.top.y);
+      renderHandleCircle(handle.bottom.x, handle.bottom.y);
 
-    // rotate handle
-    renderHandleCircle(handle.rotate.x, handle.rotate.y);
+      // rotate handle
+      renderHandleCircle(handle.rotate.x, handle.rotate.y);
   }
+  });
 }
   
 // -------------------- DRAW --------------------
@@ -528,6 +564,7 @@ function draw() {
     
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    
     renderMaskCenterHandles();
 }
 
@@ -540,18 +577,18 @@ canvas.addEventListener("touchstart", e => {
   const t = e.touches[0];
   const hit = hitResizeOrRotate(t.clientX, t.clientY);
   if (hit) {
+      maskCurrent = hit.mask;
       activeHandle = hit.type;
       centerTouchId = t.identifier;
       lastX = t.clientX;
       lastY = t.clientY;
       
       if (hit.type === "rotate") {
-        const h = getEllipseHandlePositions().rotate;
         const worldStart = screenToWorld(t.clientX, t.clientY);
         // save initial angle between center and touch
-        rotateStartAngle = Math.atan2(worldStart.y - maskY, worldStart.x - maskX);
+        rotateStartAngle = Math.atan2(worldStart.y - maskCurrent.center.y, worldStart.x - maskCurrent.center.x);
         // save current ellipse rotation
-        rotateStartRot = maskRot;
+        rotateStartRot = maskCurrent.rotation;
       }
       return;
   }
@@ -597,45 +634,41 @@ canvas.addEventListener("touchmove", e => {
 
         case "center":
             isCenterDragging = true;
-            maskX += dx;
-            maskY += dy;
+            maskCurrent.center.x += dx;
+            maskCurrent.center.y += dy;
             break;
 
         case "resize-right":
            loc = worldDeltaToLocal(dx, dy);
-           maskRx += loc.x;     // only x-direction in local space affects rx
-           if (maskRx < 5) maskRx = 5;
+           maskCurrent.rx += loc.x;     // only x-direction in local space affects rx
+           if (maskCurrent.rx < 5) maskCurrent.rx = 5;
            break;
 
         case "resize-left":
            loc = worldDeltaToLocal(dx, dy);
-           maskRx -= loc.x;     // inverted
-           if (maskRx < 5) maskRx = 5;
+           maskCurrent.rx -= loc.x;     // inverted
+           if (maskCurrent.rx < 5) maskCurrent.rx = 5;
            break;
 
         case "resize-top":
            loc = worldDeltaToLocal(dx, dy);
-           maskRy += loc.y;
-           if (maskRy < 5) maskRy = 5;
+           maskCurrent.ry += loc.y;
+           if (maskCurrent.ry < 5) maskCurrent.ry = 5;
            break;
 
         case "resize-bottom":
            loc = worldDeltaToLocal(dx, dy);
-           maskRy -= loc.y;
-           if (maskRy < 5) maskRy = 5;
+           maskCurrent.ry -= loc.y;
+           if (maskCurrent.ry < 5) maskCurrent.ry = 5;
            break;
 
         case "rotate":
-            //const h = getEllipseHandlePositions();
-            //const ang = Math.atan2(now.y - maskY, now.x - maskX);
-           // maskRot = ( ang - Math.PI/2 );
-            //break;
           const worldNow = screenToWorld(t.clientX, t.clientY);
-          const nowAngle = Math.atan2(worldNow.y - maskY, worldNow.x - maskX);
+          const nowAngle = Math.atan2(worldNow.y - maskCurrent.center.y, worldNow.x - maskCurrent.center.x);
           // delta between angles
           const delta = nowAngle - rotateStartAngle;
           // update rotation
-          maskRot = rotateStartRot + delta;
+          maskCurrent.rotation = rotateStartRot + delta;
           break;
     }
 
@@ -700,8 +733,12 @@ canvas.addEventListener("touchmove", e => {
   
 canvas.addEventListener("touchend", e => {
   if (activeHandle == "center" && !isCenterDragging){
-    maskIsSelected = !maskIsSelected;
-    draw();
+    maskCurrent.outline = !maskCurrent.outline;
+    selectMask(maskCurrent.id);
+  }
+  
+  if (activeHandle == null){
+    maskCurrent.outline = false;
   }
   
   isCenterDragging = false;
@@ -714,6 +751,7 @@ canvas.addEventListener("touchend", e => {
     isTouching = false;
     isPinching = false;
   }
+  draw();
 });
   
 // ---------------------------------------------------------
