@@ -12,15 +12,39 @@
 <canvas id="glcanvas"></canvas>
 
 <script>
-
+// ---------------------------------------------------------
+// Camera State
+// ---------------------------------------------------------
+let camX = 0, camY = 0;
+let zoom = 1;
+  
+// Image state
+let imgWidth = 1, imgHeight = 1;
+  
+// --------------------------
+// Orthographic Projection
+// --------------------------
+function ortho(left, right, bottom, top, near, far) {
+  return new Float32Array([
+    2/(right-left), 0, 0, 0,
+    0, 2/(top-bottom), 0, 0,
+    0, 0, -2/(far-near), 0,
+    -(right+left)/(right-left),
+    -(top+bottom)/(top-bottom),
+    -(far+near)/(far-near),
+    1
+  ]);
+}
+  
 // -------------------- SHADERS --------------------
 const vsSource = `
 attribute vec2 aPos;
 attribute vec2 aTex;
+uniform mat4 u_proj;
 varying vec2 vTex;
 
 void main() {
-    gl_Position = vec4(aPos, 0.0, 1.0);
+    gl_Position = u_proj * vec4(aPos, 0.0, 1.0);
     vTex = aTex;
 }
 `;
@@ -58,21 +82,23 @@ gl.attachShader(program, vs);
 gl.attachShader(program, fs);
 gl.linkProgram(program);
 gl.useProgram(program);
-  
+
+const u_proj = gl.getUniformLocation(program, "u_proj");
+ 
 function createImageBuffer(){
   // -------------------- RECTANGLE GEOMETRY --------------------
   // Full-screen rectangle (-1 to +1)
   const vertices = new Float32Array([
     //  X,   Y,   U,  V
-    -1, -1,  0,  1,  // bottom-left
-     1, -1,  1,  1,  // bottom-right
-     1,  1,  1,  0,  // top-right
-    -1,  1,  0,  0   // top-left
+    0,        imgHeight,  0,  0,  // bottom-left
+    imgWidth, imgHeight,  1,  0,  // bottom-right
+    imgWidth, 0,          1,  1,  // top-right
+    0,        0,          0,  1   // top-left
   ]);
   
   const indices = new Uint16Array([
-    0, 1, 2,
-    2, 3, 0
+    3, 2, 0,
+    0, 1, 2
   ]);
   
   // ---- VBO ----
@@ -118,9 +144,32 @@ const image = new Image();
 image.src = "http://192.168.1.35:8080/img.jpg";  // ← your image
 image.onload = () => {
     console.log("IMAGE LOADED");
+    imgHeight = image.height;
+    imgWidth = image.width;
+  
     createImageBuffer();
     loadImageToTexture(image);
 };
+
+function resetViewToFit() {
+  canvas.width = canvas.clientWidth;
+  canvas.height = canvas.clientHeight;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  
+  const screenW = canvas.clientWidth;
+  const screenH = canvas.clientHeight;
+
+  // Fit image inside screen
+  zoom = Math.min(screenW / imgWidth, screenH / imgHeight);
+
+  // Compute how large the ortho window will become
+  const viewW = screenW / zoom;
+  const viewH = screenH / zoom;
+
+  // Center camera so image is perfectly centered
+  camX = (imgWidth  - viewW) / 2;
+  camY = (imgHeight - viewH) / 2;
+}
 
 // -------------------- DRAW --------------------
 function draw() {
@@ -128,6 +177,17 @@ function draw() {
     canvas.height = canvas.clientHeight;
     gl.viewport(0, 0, canvas.width, canvas.height);
     
+    let w = canvas.width / zoom;
+    let h = canvas.height / zoom;
+
+    let left = camX;
+    let right = camX + w;
+    let bottom = camY;
+    let top = camY + h;
+  
+    const proj = ortho(left, right, bottom, top, -1, 1);
+    gl.uniformMatrix4fv(u_proj, false, proj);
+  
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -137,6 +197,7 @@ function draw() {
 }
   
 function init() {
+    resetViewToFit();
     draw();           // ✓ draw first frame
 }
   
