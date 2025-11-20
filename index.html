@@ -17,10 +17,51 @@
 // ---------------------------------------------------------
 let camX = 0, camY = 0;
 let zoom = 1;
+
+// --- Zoom limits ---
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 10;
+  
+// Touch state
+let lastX = 0, lastY = 0;
+let lastDist = 0;
+let lastMid = {x: 0, y: 0};
+let isPinching = false;
+let isTouching = false;
+
   
 // Image state
 let imgWidth = 1, imgHeight = 1;
-  
+
+function midpoint(t1, t2) {
+  return {
+    x: (t1.clientX + t2.clientX) / 2,
+    y: (t1.clientY + t2.clientY) / 2
+  };
+}
+
+function distance(t1, t2) {
+  const dx = t2.clientX - t1.clientX;
+  const dy = t2.clientY - t1.clientY;
+  return Math.hypot(dx, dy);
+}
+
+// ---------------------------------------------------------
+// Utility: convert screen (pixel) -> world coordinates
+// ---------------------------------------------------------
+function screenToWorld(px, py) {
+  const w = canvas.width / zoom;
+  const h = canvas.height / zoom;
+
+  const left = camX;
+  const bottom = camY;
+
+  const x = left + (px / canvas.width) * w;
+  const y = bottom + ((canvas.height - py) / canvas.height) * h;
+
+  return { x, y };
+}
+
 // --------------------------
 // Orthographic Projection
 // --------------------------
@@ -195,6 +236,89 @@ function draw() {
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
     console.log("draw");
 }
+
+// ---------------------------------------------------------
+// Touch Events (Pan + Pinch Zoom)
+// ---------------------------------------------------------
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault();
+
+  if (e.touches.length === 1) {
+    // Single-finger pan
+    isTouching = true;
+    isPinching = false;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  } else if (e.touches.length === 2) {
+    // Start pinch
+    isPinching = true;
+    lastDist = distance(e.touches[0], e.touches[1]);
+    lastMid = midpoint(e.touches[0], e.touches[1]);
+  }
+});
+
+canvas.addEventListener("touchmove", e => {
+  e.preventDefault();
+
+  // --- Pinch Zoom ---
+  if (isPinching && e.touches.length === 2) {
+    const t1 = e.touches[0];
+    const t2 = e.touches[1];
+
+    // Midpoint in client coords
+    const mid = midpoint(t1, t2);
+
+    // Convert midpoint to world coords BEFORE zooming
+    const worldBefore = screenToWorld(mid.x, mid.y);
+
+    // Zoom amount
+    let newDist = distance(t1, t2);
+    let scale = newDist / lastDist;
+
+    // Apply zoom with limits
+    let newZoom = zoom * scale;
+    newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, newZoom));
+
+    // Adjust pan so world point under fingers stays stable
+    zoom = newZoom;
+
+    // Convert midpoint to world coords AFTER zooming
+    const worldAfter = screenToWorld(mid.x, mid.y);
+
+    // Offset camera to keep focus stable
+    camX += (worldBefore.x - worldAfter.x);
+    camY += (worldBefore.y - worldAfter.y);
+
+    lastDist = newDist;
+    lastMid = mid;
+
+    draw();
+    return;
+  }
+  
+  // ----- Single finger pan -----
+  if (isTouching && e.touches.length === 1) {
+    const t = e.touches[0];
+
+    let dx = t.clientX - lastX;
+    let dy = t.clientY - lastY;
+
+    camX -= dx * (1 / zoom);
+    camY += dy * (1 / zoom);
+
+    lastX = t.clientX;
+    lastY = t.clientY;
+
+    draw();
+  }
+});
+  
+canvas.addEventListener("touchend", e => {
+  if (e.touches.length < 2) {
+    isTouching = false;
+    isPinching = false;
+  }
+});
   
 function init() {
     resetViewToFit();
