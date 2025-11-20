@@ -34,16 +34,84 @@ let imgWidth = 1, imgHeight = 1;
 
 let maskX = 250;
 let maskY = 250;
-let maskRadius = 100;
-
+let maskRx = 150;   // ellipse radius X
+let maskRy = 100;   // ellipse radius Y
+let maskRot = 0.0;  // radians
+let maskIsSelected = false;
+  
 let isCenterDragging = false;
 let centerTouchId = null;
+let isResizing = false;
+let isRotating = false;
+let touchArea = 20;
 
+const HANDLE_PX = 10;            // circle radius in screen pixels
+const ROTATE_OFFSET_PX = 40;     // rotate handle offset above top
+let activeHandle = null;
+let rotateStartAngle = 0;
+let rotateStartRot = 0;
+  
+function getEllipseHandlePositions() {
+  const c = Math.cos(maskRot);
+  const s = Math.sin(maskRot);
+    
+  function rot(x, y) {
+    return {
+      x: maskX + (x * c - y * s),
+      y: maskY + (x * s + y * c)
+    };
+  }
+    
+  // Convert pixel offsets to world units
+  const pixel = 1 / zoom;
+
+  return {
+      center: rot(0, 0),
+      right:  rot(maskRx, 0),
+      left:   rot(-maskRx, 0),
+      top:    rot(0, maskRy),
+      bottom: rot(0, -maskRy),
+      rotate: rot(0, -(maskRy + ROTATE_OFFSET_PX * pixel))
+  };
+}
+  
 function isInsideCenterHandle(px, py) {
     const world = screenToWorld(px, py);
     const dx = world.x - maskX;
     const dy = world.y - maskY;
-    return (dx*dx + dy*dy) <= (20 / zoom) * (20 / zoom);
+    return (dx*dx + dy*dy) <= (touchArea / zoom) * (touchArea / zoom);
+}
+
+function isInsideHandle(px, py, hx, hy) {
+    const w = screenToWorld(px, py);
+    const dx = w.x - hx;
+    const dy = w.y - hy;
+    const r = (HANDLE_PX+10) / zoom;  // convert px → world units
+    return (dx*dx + dy*dy) <= (r*r);
+}
+
+function hitResizeOrRotate(px, py) {
+    const h = getEllipseHandlePositions();
+
+    if (isInsideHandle(px, py, h.center.x, h.center.y))
+        return { type: "center" };
+
+    if (isInsideHandle(px, py, h.right.x, h.right.y))
+        return { type: "resize-right" };
+
+    if (isInsideHandle(px, py, h.left.x, h.left.y))
+        return { type: "resize-left" };
+
+    if (isInsideHandle(px, py, h.top.x, h.top.y))
+        return { type: "resize-top" };
+
+    if (isInsideHandle(px, py, h.bottom.x, h.bottom.y))
+        return { type: "resize-bottom" };
+
+    if (isInsideHandle(px, py, h.rotate.x, h.rotate.y))
+        return { type: "rotate" };
+
+    return null;
 }
   
 function midpoint(t1, t2) {
@@ -125,46 +193,96 @@ void main() {
 const fsMaskSource = `
 precision mediump float;
 
-uniform vec2 uCenter;     // world pos
-uniform float uRadius;    // world radius
-uniform float uThickness; // world thickness
-uniform float uFeather;   // softness
+uniform vec2  uCenter;
+uniform float uRx;            // ellipse radius X (world units)
+uniform float uRy;            // ellipse radius Y (world units)
+uniform float uRotation;      // radians
 
-uniform float uOutlinePx; // 1px black outline width in SCREEN pixels
-uniform float uPixelSize; // world units per screen pixel (1/zoom)
+// Thickness controls *in screen pixels*
+uniform float uThicknessPx;   // white ring thickness (px)
+uniform float uFeatherPx;     // AA softness (px)
+uniform float uOutlinePx;     // black outline width (px)
+
+// Conversion from pixel → world units
+uniform float uPixelSize;
 
 varying vec2 v_worldPos;
 
+// ------------------------------------------------------------
+// Helper: rotate point into ellipse-local coordinates
+// ------------------------------------------------------------
+vec2 rotate(vec2 p, float a) {
+    float c = cos(a);
+    float s = sin(a);
+    return vec2(p.x*c + p.y*s, -p.x*s + p.y*c);
+}
+
+// ------------------------------------------------------------
+// Signed Distance Function for ellipse
+// Returns: 0 at ellipse boundary
+//         <0 inside
+//         >0 outside
+// ------------------------------------------------------------
+float ellipseSDF(vec2 p, vec2 center, float rx, float ry, float rot) {
+    vec2 d = p - center;
+    vec2 r = rotate(d, rot);
+
+    float nx = r.x / rx;
+    float ny = r.y / ry;
+
+    return length(vec2(nx, ny)) - 1.0;
+}
+
+// ------------------------------------------------------------
+// SDF Gradient Magnitude
+// Needed to correct thickness so it stays constant in pixels.
+// THIS is what prevents stretching at wide ellipses.
+// ------------------------------------------------------------
+float ellipseGradScale(vec2 p, vec2 center, float rx, float ry, float rot) {
+    vec2 d = p - center;
+    vec2 r = rotate(d, rot);
+
+    // gradient of normalized ellipse distance
+    float gx = r.x / (rx * rx);
+    float gy = r.y / (ry * ry);
+
+    return sqrt(gx*gx + gy*gy);
+}
+
+// ------------------------------------------------------------
+// Main render
+// ------------------------------------------------------------
 void main() {
-    float d = distance(v_worldPos, uCenter);
 
-    // ---- Main white ring ----
-    float inner = uRadius - uThickness;
-    float outer = uRadius + uThickness;
+    float d = ellipseSDF(v_worldPos, uCenter, uRx, uRy, uRotation);
 
-    float whiteRing =
-        smoothstep(inner - uFeather, inner + uFeather, d) *
-        (1.0 - smoothstep(outer - uFeather, outer + uFeather, d));
+    // Pixel → world unit conversion using gradient
+    float px   = uPixelSize;
+    float grad = ellipseGradScale(v_worldPos, uCenter, uRx, uRy, uRotation);
 
-    // ---- Outer 1px black outline ----
-    float outlineOuter = uRadius + uThickness + uOutlinePx * uPixelSize;
-    float outlineInner = uRadius + uThickness;
+    float thick    = uThicknessPx * px / grad;
+    float feather  = uFeatherPx   * px / grad;
+    float outline  = uOutlinePx   * px / grad;
 
-    float blackRing =
-        smoothstep(outlineInner - uFeather, outlineInner + uFeather, d) *
-        (1.0 - smoothstep(outlineOuter - uFeather, outlineOuter + uFeather, d));
+    // White border region
+    float whiteInner = -thick;
+    float whiteOuter = +thick;
 
-    // Composite: black ring behind white ring
-    float finalAlpha = max(whiteRing, blackRing);
+    float white = smoothstep(whiteInner - feather, whiteInner + feather, -d) *
+                 (1.0 - smoothstep(whiteOuter - feather, whiteOuter + feather, -d));
 
-    if (finalAlpha < 0.01) discard;
+    // Black outline region (outside white)
+    float black = smoothstep(whiteOuter - feather, whiteOuter + feather, -d) *
+                 (1.0 - smoothstep(whiteOuter + outline - feather,
+                                   whiteOuter + outline + feather, -d));
 
-    vec3 color =
-        (blackRing > whiteRing) ?
-        vec3(0.0) :          // black outer border
-        vec3(1.0);           // white inner ring
+    float alpha = max(white, black);
 
-    gl_FragColor = vec4(color, finalAlpha);
+    if (alpha < 0.01)
+        discard;
+
+    vec3 color = (black > white) ? vec3(0.0) : vec3(1.0);
+    gl_FragColor = vec4(color, alpha);
 }
 `;
 
@@ -208,11 +326,13 @@ const uProj = gl.getUniformLocation(program, "u_proj");
 const aMaskPos = gl.getAttribLocation(maskProgram, "a_Pos");
 const uMaskProj = gl.getUniformLocation(maskProgram, "u_proj");
 const uMaskCenter = gl.getUniformLocation(maskProgram, "uCenter");
-const uMaskRadius = gl.getUniformLocation(maskProgram, "uRadius");
-const uMaskThickness = gl.getUniformLocation(maskProgram, "uThickness");  
-const uMaskFeather = gl.getUniformLocation(maskProgram, "uFeather");
+const uMaskThicknessPx = gl.getUniformLocation(maskProgram, "uThicknessPx");  
+const uMaskFeatherPx = gl.getUniformLocation(maskProgram, "uFeatherPx");
 const uMaskOutlinePx = gl.getUniformLocation(maskProgram, "uOutlinePx");
 const uMaskPixelSize = gl.getUniformLocation(maskProgram, "uPixelSize");
+const uMaskRx = gl.getUniformLocation(maskProgram, "uRx");
+const uMaskRy = gl.getUniformLocation(maskProgram, "uRy");
+const uMaskRotation = gl.getUniformLocation(maskProgram, "uRotation");
   
 function createScreenBuffer(){
   //gl.viewport(0, 0, canvas.width, canvas.height);
@@ -332,15 +452,34 @@ function renderMaskSelection(centerX, centerY){
   gl.useProgram(maskProgram);
   
   gl.uniform2f(uMaskCenter, centerX, centerY);
-  gl.uniform1f(uMaskRadius, 100.0);
-  gl.uniform1f(uMaskThickness, 1.0/zoom);
-  gl.uniform1f(uMaskFeather, 0.2); // Try 1→3 for smoother edges
+  gl.uniform1f(uMaskRx, maskRx);
+  gl.uniform1f(uMaskRy, maskRy);
+  gl.uniform1f(uMaskRotation, maskRot);
+  gl.uniform1f(uMaskThicknessPx, 1.0/zoom);
+  gl.uniform1f(uMaskFeatherPx, 0.2); // Try 1→3 for smoother edges
   // black outline stays exactly 1px on screen
   gl.uniform1f(uMaskOutlinePx, 1.0);
   // world units per pixel
   gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
   
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+  
+function renderHandleCircle(x, y) {
+    gl.useProgram(maskProgram);
+    gl.uniform2f(uMaskCenter, x, y);
+
+    const rad = (HANDLE_PX * 0.5) / zoom;
+    const thick = (HANDLE_PX * 0.6) / zoom;
+
+    gl.uniform1f(uMaskRx, rad);
+    gl.uniform1f(uMaskRy, rad);
+    gl.uniform1f(uMaskThicknessPx, thick);
+    gl.uniform1f(uMaskFeatherPx, 0.7 / zoom);
+    gl.uniform1f(uMaskOutlinePx, 1.0);
+    gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
+
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
 }
 
 function renderMaskCenterHandles() {
@@ -361,19 +500,32 @@ function renderMaskCenterHandles() {
 
   // Screen-pixel-constant radius
   const handleRadiusPx = 12; // 12px diameter
-  const handleThicknessPx = 6;
-
-  gl.uniform1f(uMaskRadius, (handleRadiusPx / zoom));
-  gl.uniform1f(uMaskThickness, (handleThicknessPx / zoom));
-  gl.uniform1f(uMaskFeather, 0.7 / zoom);
-
+  const rad = HANDLE_PX / zoom;
+  const thick = (HANDLE_PX * 0.6) / zoom;
+  
+  gl.uniform1f(uMaskRx, rad);
+  gl.uniform1f(uMaskRy, rad);
+  gl.uniform1f(uMaskThicknessPx, thick);
+  gl.uniform1f(uMaskFeatherPx, 0.7);
   gl.uniform1f(uMaskOutlinePx, 1.0);
   gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
 
   // Draw on same quad
   gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-  
-  renderMaskSelection(maskX, maskY);
+
+  if (maskIsSelected){
+    renderMaskSelection(maskX, maskY);
+
+    const handle = getEllipseHandlePositions();
+    // resize handles
+    renderHandleCircle(handle.right.x, handle.right.y);
+    renderHandleCircle(handle.left.x, handle.left.y);
+    renderHandleCircle(handle.top.x, handle.top.y);
+    renderHandleCircle(handle.bottom.x, handle.bottom.y);
+
+    // rotate handle
+    renderHandleCircle(handle.rotate.x, handle.rotate.y);
+  }
 }
   
 // -------------------- DRAW --------------------
@@ -413,13 +565,22 @@ canvas.addEventListener("touchstart", e => {
   e.preventDefault();
   
   const t = e.touches[0];
-  if (isInsideCenterHandle(t.clientX, t.clientY)) {
-    //alert("selected");
-    isCenterDragging = true;
-    centerTouchId = t.identifier;
-    lastX = t.clientX;
-    lastY = t.clientY;
-    return;
+  const hit = hitResizeOrRotate(t.clientX, t.clientY);
+  if (hit) {
+      activeHandle = hit.type;
+      centerTouchId = t.identifier;
+      lastX = t.clientX;
+      lastY = t.clientY;
+      
+      if (hit.type === "rotate") {
+        const h = getEllipseHandlePositions().rotate;
+        const worldStart = screenToWorld(t.clientX, t.clientY);
+        // save initial angle between center and touch
+        rotateStartAngle = Math.atan2(worldStart.y - maskY, worldStart.x - maskX);
+        // save current ellipse rotation
+        rotateStartRot = maskRot;
+      }
+      return;
   }
 
   if (e.touches.length === 1) {
@@ -436,24 +597,79 @@ canvas.addEventListener("touchstart", e => {
   }
 });
 
+function worldDeltaToLocal(dx, dy) {
+    const c = Math.cos(-maskRot);
+    const s = Math.sin(-maskRot);
+    return {
+        x: dx * c - dy * s,
+        y: dx * s + dy * c
+    };
+}
+  
 canvas.addEventListener("touchmove", e => {
   e.preventDefault();
 
-  // --- move mask center ---
-  if (isCenterDragging) {
-      const t = [...e.touches].find(t => t.identifier === centerTouchId);
-      if (t) {
-          const dx = t.clientX - lastX;
-          const dy = t.clientY - lastY;
+  if (activeHandle) {
+    const t = [...e.touches].find(x => x.identifier === centerTouchId);
+    if (!t) return;
 
-          maskX += dx / zoom;
-          maskY -= dy / zoom;
+    const before = screenToWorld(lastX, lastY);
+    const now    = screenToWorld(t.clientX, t.clientY);
 
-          lastX = t.clientX;
-          lastY = t.clientY;
-          draw();
-      }
-      return;
+    const dx = now.x - before.x;
+    const dy = now.y - before.y;
+
+    let loc = null;
+    switch(activeHandle) {
+
+        case "center":
+            isCenterDragging = true;
+            maskX += dx;
+            maskY += dy;
+            break;
+
+        case "resize-right":
+           loc = worldDeltaToLocal(dx, dy);
+           maskRx += loc.x;     // only x-direction in local space affects rx
+           if (maskRx < 5) maskRx = 5;
+           break;
+
+        case "resize-left":
+           loc = worldDeltaToLocal(dx, dy);
+           maskRx -= loc.x;     // inverted
+           if (maskRx < 5) maskRx = 5;
+           break;
+
+        case "resize-top":
+           loc = worldDeltaToLocal(dx, dy);
+           maskRy += loc.y;
+           if (maskRy < 5) maskRy = 5;
+           break;
+
+        case "resize-bottom":
+           loc = worldDeltaToLocal(dx, dy);
+           maskRy -= loc.y;
+           if (maskRy < 5) maskRy = 5;
+           break;
+
+        case "rotate":
+            //const h = getEllipseHandlePositions();
+            //const ang = Math.atan2(now.y - maskY, now.x - maskX);
+           // maskRot = ( ang - Math.PI/2 );
+            //break;
+          const worldNow = screenToWorld(t.clientX, t.clientY);
+          const nowAngle = Math.atan2(worldNow.y - maskY, worldNow.x - maskX);
+          // delta between angles
+          const delta = nowAngle - rotateStartAngle;
+          // update rotation
+          maskRot = rotateStartRot + delta;
+          break;
+    }
+
+    lastX = t.clientX;
+    lastY = t.clientY;
+    draw();
+    return;
   }
 
   // --- Pinch Zoom ---
@@ -510,10 +726,16 @@ canvas.addEventListener("touchmove", e => {
 });
   
 canvas.addEventListener("touchend", e => {
-  if (isCenterDragging) {
-      isCenterDragging = false;
-      centerTouchId = null;
+  if (activeHandle == "center" && !isCenterDragging){
+    maskIsSelected = !maskIsSelected;
+    draw();
   }
+  
+  isCenterDragging = false;
+  isResizing = false;
+  isRotating = false;
+  centerTouchId = null;
+  activeHandle = null;
 
   if (e.touches.length < 2) {
     isTouching = false;
