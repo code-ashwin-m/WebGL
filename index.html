@@ -29,10 +29,23 @@ let lastMid = {x: 0, y: 0};
 let isPinching = false;
 let isTouching = false;
 
-  
 // Image state
 let imgWidth = 1, imgHeight = 1;
 
+let maskX = 250;
+let maskY = 250;
+let maskRadius = 100;
+
+let isCenterDragging = false;
+let centerTouchId = null;
+
+function isInsideCenterHandle(px, py) {
+    const world = screenToWorld(px, py);
+    const dx = world.x - maskX;
+    const dy = world.y - maskY;
+    return (dx*dx + dy*dy) <= (20 / zoom) * (20 / zoom);
+}
+  
 function midpoint(t1, t2) {
   return {
     x: (t1.clientX + t2.clientX) / 2,
@@ -112,26 +125,46 @@ void main() {
 const fsMaskSource = `
 precision mediump float;
 
-uniform vec2 uCenter;   // pixel position of handler
-uniform float uRadius;  // pixel radius
-uniform float uThickness;
-uniform float uFeather; 
+uniform vec2 uCenter;     // world pos
+uniform float uRadius;    // world radius
+uniform float uThickness; // world thickness
+uniform float uFeather;   // softness
+
+uniform float uOutlinePx; // 1px black outline width in SCREEN pixels
+uniform float uPixelSize; // world units per screen pixel (1/zoom)
 
 varying vec2 v_worldPos;
 
 void main() {
     float d = distance(v_worldPos, uCenter);
 
+    // ---- Main white ring ----
     float inner = uRadius - uThickness;
     float outer = uRadius + uThickness;
 
-    // The ring mask (0 outside, 1 inside)
-    float ring = smoothstep(inner - uFeather, inner + uFeather, d) *
-                 (1.0 - smoothstep(outer - uFeather, outer + uFeather, d));
+    float whiteRing =
+        smoothstep(inner - uFeather, inner + uFeather, d) *
+        (1.0 - smoothstep(outer - uFeather, outer + uFeather, d));
 
-    if (ring < 0.01) discard;
+    // ---- Outer 1px black outline ----
+    float outlineOuter = uRadius + uThickness + uOutlinePx * uPixelSize;
+    float outlineInner = uRadius + uThickness;
 
-    gl_FragColor = vec4(1.0, 0.0, 1.0, ring);
+    float blackRing =
+        smoothstep(outlineInner - uFeather, outlineInner + uFeather, d) *
+        (1.0 - smoothstep(outlineOuter - uFeather, outlineOuter + uFeather, d));
+
+    // Composite: black ring behind white ring
+    float finalAlpha = max(whiteRing, blackRing);
+
+    if (finalAlpha < 0.01) discard;
+
+    vec3 color =
+        (blackRing > whiteRing) ?
+        vec3(0.0) :          // black outer border
+        vec3(1.0);           // white inner ring
+
+    gl_FragColor = vec4(color, finalAlpha);
 }
 `;
 
@@ -178,6 +211,8 @@ const uMaskCenter = gl.getUniformLocation(maskProgram, "uCenter");
 const uMaskRadius = gl.getUniformLocation(maskProgram, "uRadius");
 const uMaskThickness = gl.getUniformLocation(maskProgram, "uThickness");  
 const uMaskFeather = gl.getUniformLocation(maskProgram, "uFeather");
+const uMaskOutlinePx = gl.getUniformLocation(maskProgram, "uOutlinePx");
+const uMaskPixelSize = gl.getUniformLocation(maskProgram, "uPixelSize");
   
 function createScreenBuffer(){
   //gl.viewport(0, 0, canvas.width, canvas.height);
@@ -293,7 +328,22 @@ function resetViewToFit() {
   camY = (imgHeight - viewH) / 2;
 }
 
-function renderMaskHandles(){
+function renderMaskSelection(centerX, centerY){
+  gl.useProgram(maskProgram);
+  
+  gl.uniform2f(uMaskCenter, centerX, centerY);
+  gl.uniform1f(uMaskRadius, 100.0);
+  gl.uniform1f(uMaskThickness, 1.0/zoom);
+  gl.uniform1f(uMaskFeather, 0.2); // Try 1→3 for smoother edges
+  // black outline stays exactly 1px on screen
+  gl.uniform1f(uMaskOutlinePx, 1.0);
+  // world units per pixel
+  gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
+  
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
+function renderMaskCenterHandles() {
   let w = canvas.width / zoom;
   let h = canvas.height / zoom;
 
@@ -301,20 +351,31 @@ function renderMaskHandles(){
   let right = camX + w;
   let bottom = camY;
   let top = camY + h;
-    
+  
   gl.useProgram(maskProgram);
-  
-  gl.uniform2f(uMaskCenter, 250, 250);
-  gl.uniform1f(uMaskRadius, 100.0);
-  gl.uniform1f(uMaskThickness, 2.0/zoom);
-  gl.uniform1f(uMaskFeather, 0.2); // Try 1→3 for smoother edges
-  
   const maskProj = ortho(left, right, bottom, top, -1, 1);
   gl.uniformMatrix4fv(uMaskProj, false, maskProj);
   
-  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-}
+  // A small circle (white)
+  gl.uniform2f(uMaskCenter, maskX, maskY);
 
+  // Screen-pixel-constant radius
+  const handleRadiusPx = 12; // 12px diameter
+  const handleThicknessPx = 6;
+
+  gl.uniform1f(uMaskRadius, (handleRadiusPx / zoom));
+  gl.uniform1f(uMaskThickness, (handleThicknessPx / zoom));
+  gl.uniform1f(uMaskFeather, 0.7 / zoom);
+
+  gl.uniform1f(uMaskOutlinePx, 1.0);
+  gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
+
+  // Draw on same quad
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+  
+  renderMaskSelection(maskX, maskY);
+}
+  
 // -------------------- DRAW --------------------
 function draw() {
     canvas.width = canvas.clientWidth;
@@ -342,7 +403,7 @@ function draw() {
     
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    renderMaskHandles();
+    renderMaskCenterHandles();
 }
 
 // ---------------------------------------------------------
@@ -350,6 +411,16 @@ function draw() {
 // ---------------------------------------------------------
 canvas.addEventListener("touchstart", e => {
   e.preventDefault();
+  
+  const t = e.touches[0];
+  if (isInsideCenterHandle(t.clientX, t.clientY)) {
+    //alert("selected");
+    isCenterDragging = true;
+    centerTouchId = t.identifier;
+    lastX = t.clientX;
+    lastY = t.clientY;
+    return;
+  }
 
   if (e.touches.length === 1) {
     // Single-finger pan
@@ -367,6 +438,23 @@ canvas.addEventListener("touchstart", e => {
 
 canvas.addEventListener("touchmove", e => {
   e.preventDefault();
+
+  // --- move mask center ---
+  if (isCenterDragging) {
+      const t = [...e.touches].find(t => t.identifier === centerTouchId);
+      if (t) {
+          const dx = t.clientX - lastX;
+          const dy = t.clientY - lastY;
+
+          maskX += dx / zoom;
+          maskY -= dy / zoom;
+
+          lastX = t.clientX;
+          lastY = t.clientY;
+          draw();
+      }
+      return;
+  }
 
   // --- Pinch Zoom ---
   if (isPinching && e.touches.length === 2) {
@@ -422,6 +510,11 @@ canvas.addEventListener("touchmove", e => {
 });
   
 canvas.addEventListener("touchend", e => {
+  if (isCenterDragging) {
+      isCenterDragging = false;
+      centerTouchId = null;
+  }
+
   if (e.touches.length < 2) {
     isTouching = false;
     isPinching = false;
