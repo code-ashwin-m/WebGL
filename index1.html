@@ -1,0 +1,675 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>WebGL Ellipse Mask + Handles</title>
+<style>
+  body, html { margin:0; padding:0; height:100%; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; touch-action:none; }
+</style>
+</head>
+
+<body>
+<canvas id="glcanvas"></canvas>
+
+<script>
+// =============================================================
+//  STATE
+// =============================================================
+let camX = 0, camY = 0;
+let zoom = 1;
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 10;
+
+let imgWidth = 1, imgHeight = 1;
+
+const HANDLE_PX = 16;
+
+// ellipse mask
+let maskX = 0;
+let maskY = 0;
+let maskRx = 200;
+let maskRy = 150;
+let maskRot = 0;
+
+let activeHandle = null;
+let touchId = null;
+
+let rotateStartAngle = 0;
+let rotateStartRot = 0;
+
+let lastX = 0, lastY = 0;
+let lastWorldX = 0, lastWorldY = 0;
+
+let isDraggingCanvas = false;
+let isPinching = false;
+let lastDist = 0;
+let lastMid = {x:0, y:0};
+
+// =============================================================
+//  INIT WEBGL
+// =============================================================
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl", {antialias:true});
+if (!gl) alert("WebGL not supported");
+
+// -------------------------------------------------------------
+function compileShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    console.log(src);
+    throw "Shader compile failed";
+  }
+  return s;
+}
+// -------------------------------------------------------------
+function linkProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, vs);
+  gl.attachShader(p, fs);
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(p));
+    throw "Program link failed";
+  }
+  return p;
+}
+
+// =============================================================
+//  SHADERS
+// =============================================================
+
+// ---------------- IMAGE SHADER ----------------
+const vsImageSrc = `
+attribute vec2 a_Pos;
+attribute vec2 a_Tex;
+uniform mat4 u_proj;
+varying vec2 v_Tex;
+void main(){
+  gl_Position = u_proj * vec4(a_Pos,0,1);
+  v_Tex = a_Tex;
+}
+`;
+
+const fsImageSrc = `
+precision mediump float;
+varying vec2 v_Tex;
+uniform sampler2D u_Tex;
+void main(){ gl_FragColor = texture2D(u_Tex, v_Tex); }
+`;
+
+// ---------------- ELLIPSE SHADER ----------------
+const vsEllipseSrc = `
+attribute vec2 a_Pos;
+uniform mat4 u_proj;
+varying vec2 v_worldPos;
+void main(){
+  v_worldPos = a_Pos;
+  gl_Position = u_proj * vec4(a_Pos,0,1);
+}
+`;
+
+const fsEllipseSrc = `
+precision mediump float;
+
+uniform vec2  uCenter;
+uniform float uRx;
+uniform float uRy;
+uniform float uRotation;
+
+uniform float uThicknessPx;
+uniform float uFeatherPx;
+uniform float uOutlinePx;
+uniform float uPixelSize;
+
+varying vec2 v_worldPos;
+
+vec2 rot(vec2 p, float a){
+  float c=cos(a), s=sin(a);
+  return vec2(p.x*c + p.y*s, -p.x*s + p.y*c);
+}
+
+float ellipseSDF(vec2 p, vec2 c, float rx, float ry, float a){
+  vec2 d = p-c;
+  vec2 r = rot(d,a);
+  float nx = r.x/rx;
+  float ny = r.y/ry;
+  return length(vec2(nx,ny)) - 1.0;
+}
+
+float ellipseGradScale(vec2 p, vec2 c, float rx, float ry, float a){
+  vec2 d = p-c;
+  vec2 r = rot(d,a);
+  float gx = r.x/(rx*rx);
+  float gy = r.y/(ry*ry);
+  return sqrt(gx*gx + gy*gy);
+}
+
+void main(){
+  float d = ellipseSDF(v_worldPos, uCenter, uRx, uRy, uRotation);
+
+  float px = uPixelSize;
+  float g  = ellipseGradScale(v_worldPos, uCenter, uRx, uRy, uRotation);
+
+  float thick   = uThicknessPx * px / g;
+  float feather = uFeatherPx   * px / g;
+  float outline = uOutlinePx   * px / g;
+
+  float whiteInner = -thick;
+  float whiteOuter = +thick;
+
+  float white = smoothstep(whiteInner-feather,whiteInner+feather,-d)
+              * (1.0 - smoothstep(whiteOuter-feather,whiteOuter+feather,-d));
+
+  float black = smoothstep(whiteOuter-feather,whiteOuter+feather,-d)
+              * (1.0 - smoothstep(whiteOuter+outline-feather,
+                                  whiteOuter+outline+feather, -d));
+
+  float alpha = max(white, black);
+  if(alpha < 0.01) discard;
+
+  vec3 color = (black>white)?vec3(0):vec3(1);
+  gl_FragColor = vec4(color, alpha);
+}
+`;
+
+// ---------------- HANDLE CIRCLE SHADER ----------------
+const vsHandleSrc = `
+attribute vec2 a_Pos;
+uniform mat4 u_proj;
+varying vec2 v_worldPos;
+void main(){
+  v_worldPos = a_Pos;
+  gl_Position = u_proj * vec4(a_Pos,0,1);
+}
+`;
+
+const fsHandleSrc = `
+precision mediump float;
+
+uniform vec2  uCenter;
+uniform float uRadiusPx;
+uniform float uOutlinePx;
+uniform float uFeatherPx;
+uniform float uPixelSize;
+
+varying vec2 v_worldPos;
+
+void main(){
+  float px = uPixelSize;
+  float r  = uRadiusPx * px;
+  float outline = uOutlinePx * px;
+  float feather = uFeatherPx * px;
+
+  float d = distance(v_worldPos, uCenter) - r;
+
+  float white = 1.0 - smoothstep(-feather, +feather, d);
+  float black = smoothstep(-outline-feather, -outline+feather, d);
+
+  float alpha = max(white,black);
+  if(alpha < 0.01) discard;
+
+  vec3 color = (black>white)?vec3(0):vec3(1);
+  gl_FragColor = vec4(color, alpha);
+}
+`;
+
+// =============================================================
+//  PROGRAMS + LOCATIONS
+// =============================================================
+const imageProgram   = linkProgram(compileShader(gl.VERTEX_SHADER,vsImageSrc),   compileShader(gl.FRAGMENT_SHADER,fsImageSrc));
+const ellipseProgram = linkProgram(compileShader(gl.VERTEX_SHADER,vsEllipseSrc), compileShader(gl.FRAGMENT_SHADER,fsEllipseSrc));
+const handleProgram  = linkProgram(compileShader(gl.VERTEX_SHADER,vsHandleSrc),  compileShader(gl.FRAGMENT_SHADER,fsHandleSrc));
+
+// image
+const aImagePos  = gl.getAttribLocation(imageProgram,"a_Pos");
+const aImageTex  = gl.getAttribLocation(imageProgram,"a_Tex");
+const uImageProj = gl.getUniformLocation(imageProgram,"u_proj");
+const uImageTex  = gl.getUniformLocation(imageProgram,"u_Tex");
+
+// ellipse
+const aEllipsePos = gl.getAttribLocation(ellipseProgram,"a_Pos");
+const uEllipseProj= gl.getUniformLocation(ellipseProgram,"u_proj");
+const uEllipseCenter= gl.getUniformLocation(ellipseProgram,"uCenter");
+const uEllipseRx= gl.getUniformLocation(ellipseProgram,"uRx");
+const uEllipseRy= gl.getUniformLocation(ellipseProgram,"uRy");
+const uEllipseRot= gl.getUniformLocation(ellipseProgram,"uRotation");
+const uEllipseThickPx= gl.getUniformLocation(ellipseProgram,"uThicknessPx");
+const uEllipseFeatherPx= gl.getUniformLocation(ellipseProgram,"uFeatherPx");
+const uEllipseOutlinePx= gl.getUniformLocation(ellipseProgram,"uOutlinePx");
+const uEllipsePixel= gl.getUniformLocation(ellipseProgram,"uPixelSize");
+
+// handle
+const aHandlePos= gl.getAttribLocation(handleProgram,"a_Pos");
+const uHandleProj= gl.getUniformLocation(handleProgram,"u_proj");
+const uHandleCenter= gl.getUniformLocation(handleProgram,"uCenter");
+const uHandleRadiusPx= gl.getUniformLocation(handleProgram,"uRadiusPx");
+const uHandleOutlinePx= gl.getUniformLocation(handleProgram,"uOutlinePx");
+const uHandleFeatherPx= gl.getUniformLocation(handleProgram,"uFeatherPx");
+const uHandlePixel= gl.getUniformLocation(handleProgram,"uPixelSize");
+
+// =============================================================
+//  BUFFERS (fullscreen quad)
+// =============================================================
+const quadVerts = new Float32Array([
+  -1,-1,  0,0,
+   1,-1,  1,0,
+   1, 1,  1,1,
+  -1, 1,  0,1
+]);
+
+const quadIdx = new Uint16Array([0,1,2, 0,2,3]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+gl.bufferData(gl.ARRAY_BUFFER,quadVerts,gl.STATIC_DRAW);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,quadIdx,gl.STATIC_DRAW);
+
+// =============================================================
+//  MATH / TRANSFORMS
+// =============================================================
+function ortho(l,r,b,t,n,f){
+  return new Float32Array([
+    2/(r-l),0,0,0,
+    0,2/(t-b),0,0,
+    0,0,-2/(f-n),0,
+    -(r+l)/(r-l),
+    -(t+b)/(t-b),
+    -(f+n)/(f-n),
+    1
+  ]);
+}
+
+function screenToWorld(px,py){
+  const w = canvas.width/zoom;
+  const h = canvas.height/zoom;
+  const left = camX;
+  const bottom = camY;
+  const x = left + (px/canvas.width)*w;
+  const y = bottom + ((canvas.height-py)/canvas.height)*h;
+  return {x,y};
+}
+
+// =============================================================
+//  MASK HANDLE POSITIONS
+// =============================================================
+function getHandlePositions(){
+  const cosA = Math.cos(maskRot);
+  const sinA = Math.sin(maskRot);
+
+  function rot(x,y){
+    return {
+      x: maskX + (x*cosA - y*sinA),
+      y: maskY + (x*sinA + y*cosA)
+    };
+  }
+
+  const left   = rot(-maskRx,0);
+  const right  = rot(maskRx,0);
+  const top    = rot(0,maskRy);
+  const bottom = rot(0,-maskRy);
+  const rotate = rot(0, -(maskRy+60));
+
+  return {
+    center:{x:maskX,y:maskY},
+    left,right,top,bottom,rotate
+  };
+}
+
+// =============================================================
+//  HIT TEST
+// =============================================================
+function isInsideCircle(px,py,cx,cy,rpx){
+  const r = rpx/zoom;
+  const dx = px-cx;
+  const dy = py-cy;
+  return dx*dx+dy*dy <= r*r;
+}
+
+function hitTestHandles(x,y){
+  const h = getHandlePositions();
+  if (isInsideCircle(x,y,h.center.x,h.center.y,HANDLE_PX)) return "center";
+  if (isInsideCircle(x,y,h.left.x,h.left.y,HANDLE_PX))   return "left";
+  if (isInsideCircle(x,y,h.right.x,h.right.y,HANDLE_PX))  return "right";
+  if (isInsideCircle(x,y,h.top.x,h.top.y,HANDLE_PX))      return "top";
+  if (isInsideCircle(x,y,h.bottom.x,h.bottom.y,HANDLE_PX))return "bottom";
+  if (isInsideCircle(x,y,h.rotate.x,h.rotate.y,HANDLE_PX))return "rotate";
+  return null;
+}
+
+// =============================================================
+//  INTERACTION
+// =============================================================
+function beginInteraction(x,y){
+  activeHandle = hitTestHandles(x,y);
+
+  if (activeHandle === "rotate"){
+    rotateStartAngle = Math.atan2(y-maskY, x-maskX);
+    rotateStartRot = maskRot;
+  }
+}
+
+function updateInteraction(x,y){
+  if (!activeHandle) return;
+
+  const dx = x - maskX;
+  const dy = y - maskY;
+
+  const cosA = Math.cos(maskRot);
+  const sinA = Math.sin(maskRot);
+
+  const lx = dx*cosA + dy*sinA;
+  const ly = -dx*sinA + dy*cosA;
+
+  switch (activeHandle){
+    case "center":
+      maskX += (x-lastWorldX);
+      maskY += (y-lastWorldY);
+      break;
+
+    case "right":
+      maskRx = Math.max(10, lx);
+      break;
+
+    case "left":
+      maskRx = Math.max(10, -lx);
+      break;
+
+    case "top":
+      maskRy = Math.max(10, ly);
+      break;
+
+    case "bottom":
+      maskRy = Math.max(10, -ly);
+      break;
+
+    case "rotate":
+      const nowAngle = Math.atan2(y-maskY, x-maskX);
+      maskRot = rotateStartRot + (nowAngle - rotateStartAngle);
+      break;
+  }
+}
+
+// =============================================================
+//  INPUT HANDLERS (touch + mouse + pinch)
+// =============================================================
+canvas.addEventListener("touchstart", e=>{
+  e.preventDefault();
+  if (e.touches.length === 1){
+    const t = e.touches[0];
+    const w = screenToWorld(t.clientX,t.clientY);
+
+    const handle = hitTestHandles(w.x,w.y);
+    if (handle){
+      beginInteraction(w.x,w.y);
+      lastWorldX = w.x;
+      lastWorldY = w.y;
+      isDraggingCanvas = false;
+      touchId = t.identifier;
+    } else {
+      isDraggingCanvas = true;
+      lastX = t.clientX;
+      lastY = t.clientY;
+    }
+    isPinching = false;
+  }
+  else if (e.touches.length===2){
+    isPinching = true;
+    isDraggingCanvas = false;
+    activeHandle = null;
+
+    const t0 = e.touches[0], t1 = e.touches[1];
+
+    lastDist = Math.hypot(t1.clientX-t0.clientX, t1.clientY-t0.clientY);
+    lastMid  = {x:(t0.clientX+t1.clientX)/2, y:(t0.clientY+t1.clientY)/2};
+  }
+});
+
+canvas.addEventListener("touchmove", e=>{
+  e.preventDefault();
+
+  if (isPinching && e.touches.length===2){
+    const t0=e.touches[0], t1=e.touches[1];
+    const newDist=Math.hypot(t1.clientX-t0.clientX, t1.clientY-t0.clientY);
+
+    const mid={x:(t0.clientX+t1.clientX)/2, y:(t0.clientY+t1.clientY)/2};
+
+    const wBefore=screenToWorld(mid.x,mid.y);
+    zoom=Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom*(newDist/lastDist)));
+    const wAfter=screenToWorld(mid.x,mid.y);
+
+    camX+=(wBefore.x-wAfter.x);
+    camY+=(wBefore.y-wAfter.y);
+
+    lastDist=newDist;
+    lastMid=mid;
+    draw();
+    return;
+  }
+
+  if (e.touches.length===1){
+    const t = e.touches[0];
+    const x=t.clientX, y=t.clientY;
+
+    if (isDraggingCanvas){
+      const dx=(x-lastX)/zoom;
+      const dy=(y-lastY)/zoom;
+      camX-=dx;
+      camY+=dy;
+      lastX=x; lastY=y;
+    } else {
+      const w=screenToWorld(x,y);
+      updateInteraction(w.x,w.y);
+      lastWorldX=w.x;
+      lastWorldY=w.y;
+    }
+    draw();
+  }
+});
+
+canvas.addEventListener("touchend", ()=>{
+  isPinching=false;
+  isDraggingCanvas=false;
+  activeHandle=null;
+  touchId=null;
+});
+
+// MOUSE
+let isMouseDown=false;
+canvas.addEventListener("mousedown", e=>{
+  const w=screenToWorld(e.clientX,e.clientY);
+  const handle=hitTestHandles(w.x,w.y);
+
+  if (handle){
+    beginInteraction(w.x,w.y);
+    lastWorldX=w.x;
+    lastWorldY=w.y;
+    isDraggingCanvas=false;
+  } else {
+    isDraggingCanvas=true;
+    lastX=e.clientX;
+    lastY=e.clientY;
+  }
+  isMouseDown=true;
+});
+
+canvas.addEventListener("mousemove", e=>{
+  if (!isMouseDown) return;
+
+  if (isDraggingCanvas){
+    const dx=(e.clientX-lastX)/zoom;
+    const dy=(e.clientY-lastY)/zoom;
+    camX-=dx;
+    camY+=dy;
+    lastX=e.clientX;
+    lastY=e.clientY;
+  } else {
+    const w=screenToWorld(e.clientX,e.clientY);
+    updateInteraction(w.x,w.y);
+    lastWorldX=w.x;
+    lastWorldY=w.y;
+  }
+  draw();
+});
+
+canvas.addEventListener("mouseup", ()=>{
+  isMouseDown=false;
+  isDraggingCanvas=false;
+  activeHandle=null;
+});
+
+// Wheel zoom
+canvas.addEventListener("wheel", e=>{
+  e.preventDefault();
+  const mx=e.clientX, my=e.clientY;
+
+  const wBefore=screenToWorld(mx,my);
+  const factor = e.deltaY > 0 ? 0.9 : 1.1;
+  zoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoom*factor));
+  const wAfter=screenToWorld(mx,my);
+
+  camX += (wBefore.x - wAfter.x);
+  camY += (wBefore.y - wAfter.y);
+
+  draw();
+});
+
+// =============================================================
+//  DRAW
+// =============================================================
+function setQuadAttribs(program, aPos, aTex=null){
+  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+
+  const stride = 4*4;
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, stride, 0);
+
+  if (aTex !== null) {
+    gl.enableVertexAttribArray(aTex);
+    gl.vertexAttribPointer(aTex, 2, gl.FLOAT, false, stride, 2*4);
+  }
+}
+
+function drawImage(proj){
+  gl.useProgram(imageProgram);
+  setQuadAttribs(imageProgram, aImagePos, aImageTex);
+
+  gl.uniformMatrix4fv(uImageProj,false,proj);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.uniform1i(uImageTex, 0);
+
+  gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+}
+
+function drawEllipseMask(proj){
+  gl.useProgram(ellipseProgram);
+  setQuadAttribs(ellipseProgram, aEllipsePos);
+
+  gl.uniformMatrix4fv(uEllipseProj,false,proj);
+  gl.uniform2f(uEllipseCenter,maskX,maskY);
+  gl.uniform1f(uEllipseRx,maskRx);
+  gl.uniform1f(uEllipseRy,maskRy);
+  gl.uniform1f(uEllipseRot,maskRot);
+
+  gl.uniform1f(uEllipseThickPx,2.0);
+  gl.uniform1f(uEllipseOutlinePx,1.3);
+  gl.uniform1f(uEllipseFeatherPx,1.0);
+  gl.uniform1f(uEllipsePixel,1.0/zoom);
+
+  gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+}
+
+function drawHandleCircle(x,y){
+  gl.useProgram(handleProgram);
+  setQuadAttribs(handleProgram, aHandlePos);
+
+  gl.uniformMatrix4fv(uHandleProj,false,currentProj);
+  gl.uniform2f(uHandleCenter,x,y);
+  gl.uniform1f(uHandleRadiusPx,HANDLE_PX);
+  gl.uniform1f(uHandleOutlinePx,1.0);
+  gl.uniform1f(uHandleFeatherPx,1.0);
+  gl.uniform1f(uHandlePixel,1.0/zoom);
+
+  gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+}
+
+let currentProj=null;
+
+function draw(){
+  canvas.width=canvas.clientWidth;
+  canvas.height=canvas.clientHeight;
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const w=canvas.width/zoom;
+  const h=canvas.height/zoom;
+
+  const left=camX;
+  const right=camX+w;
+  const bottom=camY;
+  const top=camY+h;
+
+  currentProj = ortho(left,right,bottom,top,-1,1);
+
+  drawImage(currentProj);
+  drawEllipseMask(currentProj);
+
+  const hpos = getHandlePositions();
+  drawHandleCircle(hpos.center.x, hpos.center.y);
+  drawHandleCircle(hpos.left.x,   hpos.left.y);
+  drawHandleCircle(hpos.right.x,  hpos.right.y);
+  drawHandleCircle(hpos.top.x,    hpos.top.y);
+  drawHandleCircle(hpos.bottom.x, hpos.bottom.y);
+  drawHandleCircle(hpos.rotate.x, hpos.rotate.y);
+}
+
+// =============================================================
+//  IMAGE LOADING
+// =============================================================
+let tex = gl.createTexture();
+const image = new Image();
+image.src = "img1.jpg";   // PUT YOUR IMAGE PATH HERE
+
+image.onload = ()=>{
+  imgWidth = image.width;
+  imgHeight = image.height;
+
+  gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,image);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+
+  fitImageToScreen();
+  draw();
+};
+
+function fitImageToScreen(){
+  const cw=canvas.clientWidth, ch=canvas.clientHeight;
+
+  if (imgWidth/imgHeight > cw/ch) zoom = cw/imgWidth;
+  else zoom = ch/imgHeight;
+
+  camX = -imgWidth/2;
+  camY = -imgHeight/2;
+
+  maskX=0;
+  maskY=0;
+}
+
+// Resize redraw
+window.addEventListener("resize", draw);
+
+</script>
+</body>
+</html>

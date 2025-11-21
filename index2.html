@@ -209,13 +209,18 @@ void main() {
 }
 `;
 
+// Modified: vsMask now accepts a normalized quad (0..1) and a uMaskBounds vec4
 const vsMaskSource = `
 attribute vec2 a_Pos;
 uniform mat4 u_proj;
+uniform vec4 uMaskBounds; // x=left, y=right, z=bottom, w=top
 varying vec2 v_worldPos;
 void main() {
-    v_worldPos = a_Pos;
-    gl_Position = u_proj * vec4(a_Pos, 0.0, 1.0);
+    // Map normalized [0..1] a_Pos into world-space using uMaskBounds
+    float worldX = uMaskBounds.x + a_Pos.x * (uMaskBounds.y - uMaskBounds.x);
+    float worldY = uMaskBounds.z + a_Pos.y * (uMaskBounds.w - uMaskBounds.z);
+    v_worldPos = vec2(worldX, worldY);
+    gl_Position = u_proj * vec4(v_worldPos, 0.0, 1.0);
 }
 `;
 
@@ -327,6 +332,7 @@ const uProj = gl.getUniformLocation(program, "u_proj");
 
 const aMaskPos = gl.getAttribLocation(maskProgram, "a_Pos");
 const uMaskProj = gl.getUniformLocation(maskProgram, "u_proj");
+const uMaskBounds = gl.getUniformLocation(maskProgram, "uMaskBounds"); // NEW
 const uMaskCenter = gl.getUniformLocation(maskProgram, "uCenter");
 const uMaskThicknessPx = gl.getUniformLocation(maskProgram, "uThicknessPx");  
 const uMaskFeatherPx = gl.getUniformLocation(maskProgram, "uFeatherPx");
@@ -339,12 +345,13 @@ const uMaskRotation = gl.getUniformLocation(maskProgram, "uRotation");
 function createScreenBuffer(){
   //gl.viewport(0, 0, canvas.width, canvas.height);
   
+  // Unit quad (normalized 0..1). We'll map this to the current world view using uMaskBounds.
   const screenVertices = new Float32Array([
-    //X,   Y
-    0, 0,
-    1, 0,
-    1, 1,
-    0, 1,
+    // X, Y  (normalized)
+    0.0, 0.0,  // bottom-left
+    1.0, 0.0,  // bottom-right
+    1.0, 1.0,  // top-right
+    0.0, 1.0   // top-left
   ]);
   
   const screenIndices = new Uint16Array([
@@ -363,6 +370,7 @@ function createScreenBuffer(){
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, screenIndices, gl.STATIC_DRAW);
 
   gl.enableVertexAttribArray(aMaskPos);
+  // now tightly-packed vec2 floats -> stride 0
   gl.vertexAttribPointer(aMaskPos, 2, gl.FLOAT, false, 0, 0);
 
 }
@@ -496,6 +504,9 @@ function renderMaskCenterHandles() {
   gl.useProgram(maskProgram);
   const maskProj = ortho(left, right, bottom, top, -1, 1);
   gl.uniformMatrix4fv(uMaskProj, false, maskProj);
+
+  // NEW: provide bounds so the unit quad maps to the current world view
+  gl.uniform4f(uMaskBounds, left, right, bottom, top);
   
   masks.forEach(mask => {
     // A small circle (white)
@@ -513,7 +524,7 @@ function renderMaskCenterHandles() {
     gl.uniform1f(uMaskOutlinePx, 1.0);
     gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
 
-    // Draw on same quad
+    // Draw on the full-view quad (mapped using uMaskBounds)
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
 
     if (mask.selected && mask.outline){

@@ -52,9 +52,13 @@ class Mask {
         this.type = type;          // "circle" or "ellipse"
         this.center = { x: 250, y: 250 };
         this.rx = 150; this.ry = 100; // For ellipse
-        this.rotation = 0;         // Rotation in degrees (for ellipse)
+        this.rotation = 0;         // Rotation in radians (for ellipse)
         this.selected = false;     // If this mask is active/selected
         this.outline = false;
+
+        // NEW: per-mask feather (in screen pixels) and exposure (in stops)
+        this.feather = 30;         // default feather radius in screen px
+        this.exposure = 0.0;       // exposure in stops (Lightroom style)
     }
 }
 
@@ -209,16 +213,23 @@ void main() {
 }
 `;
 
+// Modified: vsMask now accepts a normalized quad (0..1) and a uMaskBounds vec4
 const vsMaskSource = `
 attribute vec2 a_Pos;
 uniform mat4 u_proj;
+uniform vec4 uMaskBounds; // x=left, y=right, z=bottom, w=top
 varying vec2 v_worldPos;
 void main() {
-    v_worldPos = a_Pos;
-    gl_Position = u_proj * vec4(a_Pos, 0.0, 1.0);
+    // Map normalized [0..1] a_Pos into world-space using uMaskBounds
+    float worldX = uMaskBounds.x + a_Pos.x * (uMaskBounds.y - uMaskBounds.x);
+    float worldY = uMaskBounds.z + a_Pos.y * (uMaskBounds.w - uMaskBounds.z);
+    v_worldPos = vec2(worldX, worldY);
+    gl_Position = u_proj * vec4(v_worldPos, 0.0, 1.0);
 }
 `;
 
+// This fragment shader is used previously for drawing the visible white/black ring in overlay.
+// We'll keep it for the overlay (so handles and visual ring look the same).
 const fsMaskSource = `
 precision mediump float;
 
@@ -287,6 +298,85 @@ void main() {
 }
 `;
 
+// -------------------- NEW: Mask generation shader (writes feathered mask to texture) --------------------
+// This shader writes the per-pixel mask value into the red channel (0..1).
+const fsMaskGenSource = `
+precision highp float;
+
+uniform vec2 uCenter;     // world pos
+uniform float uRx;        // ellipse radius X (world)
+uniform float uRy;        // ellipse radius Y (world)
+uniform float uRotation;  // radians
+uniform float uFeatherPx; // feather in SCREEN pixels
+uniform float uPixelSize; // world units per screen pixel (1/zoom)
+
+varying vec2 v_worldPos;
+
+float ellipseDist(vec2 p, vec2 center, float rx, float ry, float rotation) {
+    vec2 d = p - center;
+    float c = cos(rotation);
+    float s = sin(rotation);
+    vec2 r = vec2(
+        d.x * c + d.y * s,
+       -d.x * s + d.y * c
+    );
+    return length(vec2(r.x / rx, r.y / ry));
+}
+
+void main() {
+    float d = ellipseDist(v_worldPos, uCenter, uRx, uRy, uRotation);
+
+    // convert feather in screen pixels to normalized ellipse distance
+    // feather world units = uFeatherPx * uPixelSize
+    float normFeather = (uFeatherPx * uPixelSize) / min(uRx, uRy);
+
+    float inner = 1.0 - normFeather;
+
+    float mask;
+    if (d < inner) {
+        mask = 1.0;
+    } else if (d > 1.0) {
+        mask = 0.0;
+    } else {
+        mask = smoothstep(1.0, inner, d);
+    }
+
+    gl_FragColor = vec4(mask, 0.0, 0.0, 1.0);
+}
+`;
+
+// -------------------- NEW: Composite shader --------------------
+// Samples the original image and the mask texture and applies exposure in masked areas.
+const fsCompositeSource = `
+precision highp float;
+varying vec2 v_worldPos;
+
+uniform sampler2D uImage;
+uniform sampler2D uMask;
+uniform float uExposure; // in stops
+uniform float uImgW;
+uniform float uImgH;
+
+void main() {
+    // compute uv from world pos (image-space -> uv)
+    vec2 uv = vec2(v_worldPos.x / uImgW, 1.0 - (v_worldPos.y / uImgH));
+    // clamp uv to avoid sampling outside
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+
+    vec3 base = texture2D(uImage, uv).rgb;
+    float mask = texture2D(uMask, uv).r;
+
+    float expFactor = pow(2.0, uExposure);
+    vec3 adjusted = base * expFactor;
+
+    vec3 finalColor = mix(base, adjusted, mask);
+
+    gl_FragColor = vec4(finalColor, 1.0);
+}
+`;
+
+// Vertex shader for mask-gen & composite & overlay is the same as vsMaskSource (maps unit quad -> world via uMaskBounds)
+
 // -------------------- INIT WEBGL --------------------
 const canvas = document.getElementById("glcanvas");
 const gl = canvas.getContext("webgl");
@@ -320,13 +410,31 @@ gl.attachShader(maskProgram, vsMask);
 gl.attachShader(maskProgram, fsMask);
 gl.linkProgram(maskProgram);
 
+// -------------------- NEW PROGRAMS --------------------
+const vsMaskGen = vsMask; // reuse compiled vertex shader (same source)
+const fsMaskGen = compileShader(gl.FRAGMENT_SHADER, fsMaskGenSource);
+const maskGenProgram = gl.createProgram();
+gl.attachShader(maskGenProgram, vsMaskGen);
+gl.attachShader(maskGenProgram, fsMaskGen);
+gl.linkProgram(maskGenProgram);
+
+const vsComposite = vsMask; // reuse same vertex shader
+const fsComposite = compileShader(gl.FRAGMENT_SHADER, fsCompositeSource);
+const compositeProgram = gl.createProgram();
+gl.attachShader(compositeProgram, vsComposite);
+gl.attachShader(compositeProgram, fsComposite);
+gl.linkProgram(compositeProgram);
+
+// get attrib/uniform locations (existing)
 const aPos = gl.getAttribLocation(program, "a_Pos");
 const aTex = gl.getAttribLocation(program, "a_Tex");
 const uTex = gl.getUniformLocation(program, "u_Tex");
 const uProj = gl.getUniformLocation(program, "u_proj");
 
+// mask program locations
 const aMaskPos = gl.getAttribLocation(maskProgram, "a_Pos");
 const uMaskProj = gl.getUniformLocation(maskProgram, "u_proj");
+const uMaskBounds = gl.getUniformLocation(maskProgram, "uMaskBounds"); // NEW
 const uMaskCenter = gl.getUniformLocation(maskProgram, "uCenter");
 const uMaskThicknessPx = gl.getUniformLocation(maskProgram, "uThicknessPx");  
 const uMaskFeatherPx = gl.getUniformLocation(maskProgram, "uFeatherPx");
@@ -335,16 +443,72 @@ const uMaskPixelSize = gl.getUniformLocation(maskProgram, "uPixelSize");
 const uMaskRx = gl.getUniformLocation(maskProgram, "uRx");
 const uMaskRy = gl.getUniformLocation(maskProgram, "uRy");
 const uMaskRotation = gl.getUniformLocation(maskProgram, "uRotation");
-  
+
+// maskGen uniforms
+const aMaskGenPos = gl.getAttribLocation(maskGenProgram, "a_Pos");
+const uMaskGenProj = gl.getUniformLocation(maskGenProgram, "u_proj");
+const uMaskGenBounds = gl.getUniformLocation(maskGenProgram, "uMaskBounds");
+const uMaskGenCenter = gl.getUniformLocation(maskGenProgram, "uCenter");
+const uMaskGenRx = gl.getUniformLocation(maskGenProgram, "uRx");
+const uMaskGenRy = gl.getUniformLocation(maskGenProgram, "uRy");
+const uMaskGenRotation = gl.getUniformLocation(maskGenProgram, "uRotation");
+const uMaskGenFeatherPx = gl.getUniformLocation(maskGenProgram, "uFeatherPx");
+const uMaskGenPixelSize = gl.getUniformLocation(maskGenProgram, "uPixelSize");
+
+// composite uniforms
+const aCompositePos = gl.getAttribLocation(compositeProgram, "a_Pos");
+const uCompositeProj = gl.getUniformLocation(compositeProgram, "u_proj");
+const uCompositeBounds = gl.getUniformLocation(compositeProgram, "uMaskBounds");
+const uCompositeImage = gl.getUniformLocation(compositeProgram, "uImage");
+const uCompositeMask = gl.getUniformLocation(compositeProgram, "uMask");
+const uCompositeExposure = gl.getUniformLocation(compositeProgram, "uExposure");
+const uCompositeImgW = gl.getUniformLocation(compositeProgram, "uImgW");
+const uCompositeImgH = gl.getUniformLocation(compositeProgram, "uImgH");
+
+// -------------------- MASK FBO + TEXTURE (NEW) --------------------
+let maskFbo = null;
+let maskTexture = null;
+
+// We'll also keep a reference to the image texture
+let imageTexture = null;
+
+function createMaskFbo() {
+    // delete previous if exists
+    if (maskTexture) { gl.deleteTexture(maskTexture); maskTexture = null; }
+    if (maskFbo) { gl.deleteFramebuffer(maskFbo); maskFbo = null; }
+
+    maskTexture = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+    // RGBA8 because webgl1 doesn't expose R8; sample red channel anyway
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, canvas.width, canvas.height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    maskFbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, maskFbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, maskTexture, 0);
+
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+        console.warn("Mask FBO incomplete:", status);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// -------------------- CREATE BUFFERS --------------------
 function createScreenBuffer(){
   //gl.viewport(0, 0, canvas.width, canvas.height);
   
+  // Unit quad (normalized 0..1). We'll map this to the current world view using uMaskBounds.
   const screenVertices = new Float32Array([
-    //X,   Y
-    0, 0,
-    1, 0,
-    1, 1,
-    0, 1,
+    // X, Y  (normalized)
+    0.0, 0.0,  // bottom-left
+    1.0, 0.0,  // bottom-right
+    1.0, 1.0,  // top-right
+    0.0, 1.0   // top-left
   ]);
   
   const screenIndices = new Uint16Array([
@@ -362,9 +526,26 @@ function createScreenBuffer(){
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, screenIBO);
   gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, screenIndices, gl.STATIC_DRAW);
 
-  gl.enableVertexAttribArray(aMaskPos);
-  gl.vertexAttribPointer(aMaskPos, 2, gl.FLOAT, false, 0, 0);
+  // IMPORTANT: set attribute pointer for every program that will use this quad.
+  // Previously we only set aMaskPos (for maskProgram). Now set for maskProgram, maskGenProgram, compositeProgram.
 
+  // maskProgram attribute
+  if (aMaskPos !== -1 && aMaskPos !== null) {
+    gl.enableVertexAttribArray(aMaskPos);
+    gl.vertexAttribPointer(aMaskPos, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // maskGenProgram attribute (may have different location index)
+  if (aMaskGenPos !== -1 && aMaskGenPos !== null) {
+    gl.enableVertexAttribArray(aMaskGenPos);
+    gl.vertexAttribPointer(aMaskGenPos, 2, gl.FLOAT, false, 0, 0);
+  }
+
+  // compositeProgram attribute
+  if (aCompositePos !== -1 && aCompositePos !== null) {
+    gl.enableVertexAttribArray(aCompositePos);
+    gl.vertexAttribPointer(aCompositePos, 2, gl.FLOAT, false, 0, 0);
+  }
 }
 
 function createImageBuffer(){
@@ -416,6 +597,9 @@ function loadImageToTexture(image){
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    // NEW: store global reference to image texture
+    imageTexture = tex;
 }
 // -------------------- LOAD IMAGE --------------------
 const image = new Image();
@@ -428,6 +612,9 @@ image.onload = () => {
     createScreenBuffer();
     createImageBuffer();
     loadImageToTexture(image);
+
+    // create mask FBO now that canvas size and image are known
+    createMaskFbo();
 };
 
 function resetViewToFit() {
@@ -448,6 +635,9 @@ function resetViewToFit() {
   // Center camera so image is perfectly centered
   camX = (imgWidth  - viewW) / 2;
   camY = (imgHeight - viewH) / 2;
+
+  // recreate mask FBO for new canvas size
+  if (canvas.width > 0 && canvas.height > 0) createMaskFbo();
 }
 
 function renderMaskSelection(mask){
@@ -496,6 +686,9 @@ function renderMaskCenterHandles() {
   gl.useProgram(maskProgram);
   const maskProj = ortho(left, right, bottom, top, -1, 1);
   gl.uniformMatrix4fv(uMaskProj, false, maskProj);
+
+  // NEW: provide bounds so the unit quad maps to the current world view
+  gl.uniform4f(uMaskBounds, left, right, bottom, top);
   
   masks.forEach(mask => {
     // A small circle (white)
@@ -513,7 +706,7 @@ function renderMaskCenterHandles() {
     gl.uniform1f(uMaskOutlinePx, 1.0);
     gl.uniform1f(uMaskPixelSize, 1.0 / zoom);
 
-    // Draw on same quad
+    // Draw on the full-view quad (mapped using uMaskBounds)
     gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
 
     if (mask.selected && mask.outline){
@@ -531,8 +724,106 @@ function renderMaskCenterHandles() {
   }
   });
 }
-  
-// -------------------- DRAW --------------------
+
+// -------------------- NEW: Render mask(s) into maskTexture FBO --------------------
+function renderMasksToTexture() {
+    if (!maskFbo || !maskTexture) return;
+
+    // Bind mask FBO and render into it
+    gl.bindFramebuffer(gl.FRAMEBUFFER, maskFbo);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    // Clear mask texture to zero
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    // Set projection/bounds so our unit quad maps to world
+    let w = canvas.width / zoom;
+    let h = canvas.height / zoom;
+    let left = camX;
+    let right = camX + w;
+    let bottom = camY;
+    let top = camY + h;
+    const maskProj = ortho(left, right, bottom, top, -1, 1);
+
+    // We will draw masks that are selected OR have non-zero exposure
+    gl.useProgram(maskGenProgram);
+    gl.uniformMatrix4fv(uMaskGenProj, false, maskProj);
+    gl.uniform4f(uMaskGenBounds, left, right, bottom, top);
+
+    // Use additive blending so overlapping selected masks combine (clamped to 1.0)
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE);
+
+    // draw each relevant mask into mask texture
+    for (let mask of masks) {
+        if (!mask.selected && Math.abs(mask.exposure) < 1e-6) continue; // only selected or non-zero exposure
+
+        gl.uniform2f(uMaskGenCenter, mask.center.x, mask.center.y);
+        gl.uniform1f(uMaskGenRx, mask.rx);
+        gl.uniform1f(uMaskGenRy, mask.ry);
+        gl.uniform1f(uMaskGenRotation, mask.rotation);
+        // feather passed in screen pixels
+        gl.uniform1f(uMaskGenFeatherPx, mask.feather);
+        gl.uniform1f(uMaskGenPixelSize, 1.0 / zoom);
+
+        gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+    }
+
+    // restore default blending
+    gl.disable(gl.BLEND);
+
+    // unbind FBO — next we'll composite to the default framebuffer
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// -------------------- NEW: Composite pass (image + mask -> screen) --------------------
+function renderComposite() {
+    // Bind default framebuffer (already the default when null)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
+    // Setup projection/bounds
+    let w = canvas.width / zoom;
+    let h = canvas.height / zoom;
+    let left = camX;
+    let right = camX + w;
+    let bottom = camY;
+    let top = camY + h;
+    const compProj = ortho(left, right, bottom, top, -1, 1);
+
+    gl.useProgram(compositeProgram);
+    gl.uniformMatrix4fv(uCompositeProj, false, compProj);
+    gl.uniform4f(uCompositeBounds, left, right, bottom, top);
+
+    // bind image texture -> unit 0
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, imageTexture);
+    gl.uniform1i(uCompositeImage, 0);
+
+    // bind mask texture -> unit 1
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+    gl.uniform1i(uCompositeMask, 1);
+
+    // exposure: use maskCurrent.exposure if set, else 0
+    let exposure = 0.0;
+    if (maskCurrent && maskCurrent.selected) exposure = maskCurrent.exposure;
+    gl.uniform1f(uCompositeExposure, exposure);
+
+    // image dims for uv mapping
+    gl.uniform1f(uCompositeImgW, imgWidth);
+    gl.uniform1f(uCompositeImgH, imgHeight);
+
+    // draw the quad (samples image + mask inside shader)
+    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+    // unbind textures
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+// -------------------- DRAW (updated pipeline) --------------------
 function draw() {
     canvas.width = canvas.clientWidth;
     canvas.height = canvas.clientHeight;
@@ -546,20 +837,19 @@ function draw() {
     let bottom = camY;
     let top = camY + h;
     
-    gl.useProgram(program);
-    const proj = ortho(left, right, bottom, top, -1, 1);
-    gl.uniformMatrix4fv(uProj, false, proj);
-  
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-  
-    //Render Image
-    gl.disable(gl.GL_BLEND);
-    gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
-    
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    
+    // ---------- We no longer draw the image directly to screen ----------
+    // Instead:
+    // 1) render selected/active masks into maskTexture
+    // 2) composite image + maskTexture to screen
+    // 3) draw overlay handles on top
+
+    // 1) render mask(s) to texture
+    renderMasksToTexture();
+
+    // 2) composite pass (image + mask -> screen)
+    renderComposite();
+
+    // 3) overlay handles (drawn on top of the composed image)
     renderMaskCenterHandles();
 }
 
