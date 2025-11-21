@@ -36,7 +36,6 @@ export class RenderEngine {
   // Public API
   // -------------------------
   setCamera(camX, camY, zoom) {
-    alert(camX);
     this.camX = camX; this.camY = camY; this.zoom = zoom;
   }
 
