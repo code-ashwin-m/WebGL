@@ -16,12 +16,17 @@ export const ShaderPipeline = {
     let header = `
 precision mediump float;
 varying vec2 v_Tex;
+varying vec2 v_worldPos;
 uniform sampler2D uImage;
+uniform float uImgW;
+uniform float uImgH;
 `;
     
     let main = `
 void main() {
-    gl_FragColor = texture2D(uImage, v_Tex);
+    vec2 uv = vec2(v_worldPos.x / uImgW, 1.0 - (v_worldPos.y / uImgH));
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+    gl_FragColor = texture2D(uImage, uv);
 }
 `;
     return header + '\n' + main;

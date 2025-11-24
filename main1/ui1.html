@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Lightroom UI Demo</title>
+<link rel="stylesheet" href="css/ui1.css" />
+</head>
+<body>
+
+<div id="app">
+  <header id="topbar">
+      <button class="icon-btn" id="backBtn">←</button>
+      <div class="title">Edit</div>
+      <button class="icon-btn" id="exportBtn">⤴</button>
+  </header>
+  
+  <!-- Image / Canvas Workspace -->
+  <div id="workspace">
+    <canvas id="glCanvas"></canvas>
+  </div>
+
+  <!-- Popup Sliders Panel -->
+  <div id="sliderPopup">
+    <div id="sliderContent"></div>
+  </div>
+
+  <!-- Bottom Tool Bar -->
+  <div id="bottomBar">
+    <div class="tool" data-tool="light">Light</div>
+    <div class="tool" data-tool="color">Color</div>
+    <div class="tool" data-tool="effects">Effects</div>
+    <div class="tool" data-tool="detail">Detail</div>
+  </div>
+
+</div>
+
+<script type="module">
+import { RenderEngine } from './js/RenderEngine.js';
+import { UI } from './js/UI.js';
+import { App } from './js/ui1.js';
+
+// create engine + UI
+const canvas = document.getElementById('glCanvas');
+const engine = new RenderEngine(canvas);
+const ui = new UI(canvas, engine);
+const app = new App(engine);
+  
+// expose for console tweaks
+window.engine = engine;
+window.ui = ui;
+</script>
+</body>
+</html>
+
+
+
+

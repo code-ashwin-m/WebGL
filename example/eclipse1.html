@@ -1,0 +1,221 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGL Antialiased Circle (Touch Supported)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+  <style>
+    html,body { margin:0; height:100%; background:#333; overflow:hidden; }
+    canvas { width:100%; height:100%; display:block; touch-action:none; }
+  </style>
+</head>
+<body>
+
+<canvas id="glcanvas"></canvas>
+
+<!-- Vertex Shader -->
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+</script>
+
+<!-- Fragment Shader -->
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+varying vec2 v_uv;
+
+uniform vec2 u_resolution;
+uniform vec2 u_center;
+uniform float u_radius;
+uniform float u_white_th;
+uniform float u_black_th;
+uniform float u_feather;
+
+float ringMask(float d, float r_center, float th, float feather){
+    float half = th * 0.5;
+    float inner = r_center - half;
+    float outer = r_center + half;
+
+    float outerEdge = smoothstep(outer + feather, outer - feather, d);
+    float innerEdge = smoothstep(inner - feather, inner + feather, d);
+    return outerEdge * innerEdge;
+}
+
+void main() {
+    vec2 p = v_uv * u_resolution;
+    float d = distance(p, u_center);
+    float fe = max(0.5, u_feather);
+
+    float whiteMask = ringMask(d, u_radius, u_white_th, fe);
+
+    float white_half = u_white_th * 0.5;
+    float black_center = u_radius - white_half - (u_black_th * 0.5);
+    float blackMask = ringMask(d, black_center, u_black_th, fe);
+
+    float blackContrib = blackMask;
+    float whiteContrib = max(0.0, whiteMask - blackMask);
+    float alpha = blackContrib + whiteContrib;
+
+    vec3 col = (blackContrib > 0.0) ? vec3(0.0) : vec3(1.0);
+    gl_FragColor = vec4(col, alpha);
+}
+</script>
+
+<script>
+// ---------------- SHADER HELPERS ----------------
+function createShader(gl, type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+        console.error(gl.getShaderInfoLog(s));
+        return null;
+    }
+    return s;
+}
+
+function createProgram(gl, vsSrc, fsSrc){
+    const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+    const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+    const p = gl.createProgram();
+    gl.attachShader(p, vs);
+    gl.attachShader(p, fs);
+    gl.linkProgram(p);
+    if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(p));
+        return null;
+    }
+    return p;
+}
+
+(function main(){
+    const canvas = document.getElementById("glcanvas");
+    const gl = canvas.getContext("webgl", {antialias:false});
+    if(!gl){
+        alert("WebGL not supported");
+        return;
+    }
+
+    // --- FIXED: READ SHADERS THE CORRECT WAY ---
+    const vsSrc = document.getElementById("vs").textContent;
+    const fsSrc = document.getElementById("fs").textContent;
+
+    const program = createProgram(gl, vsSrc, fsSrc);
+    gl.useProgram(program);
+
+    // Fullscreen quad
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1,-1, 1,-1, -1,1, 1,1
+    ]), gl.STATIC_DRAW);
+
+    const a_pos = gl.getAttribLocation(program, "a_pos");
+    gl.enableVertexAttribArray(a_pos);
+    gl.vertexAttribPointer(a_pos, 2, gl.FLOAT, false, 0, 0);
+
+    const u_resolution = gl.getUniformLocation(program, "u_resolution");
+    const u_center = gl.getUniformLocation(program, "u_center");
+    const u_radius = gl.getUniformLocation(program, "u_radius");
+    const u_white_th = gl.getUniformLocation(program, "u_white_th");
+    const u_black_th = gl.getUniformLocation(program, "u_black_th");
+    const u_feather = gl.getUniformLocation(program, "u_feather");
+
+    let center = { x: 300, y: 350 };
+    let radius = 180;
+
+    // ---------------- Resize ----------------
+    function resize(){
+        const dpr = window.devicePixelRatio || 1;
+        const w = canvas.clientWidth * dpr;
+        const h = canvas.clientHeight * dpr;
+        canvas.width = w;
+        canvas.height = h;
+        gl.viewport(0,0,w,h);
+    }
+
+    // ---------------- Render ----------------
+    function render(){
+        resize();
+
+        gl.uniform2f(u_resolution, canvas.width, canvas.height);
+        gl.uniform2f(u_center, center.x, center.y);
+        gl.uniform1f(u_radius, radius);
+
+        gl.uniform1f(u_white_th, 5.0);
+        gl.uniform1f(u_black_th, 1.0);
+        gl.uniform1f(u_feather, 1.0);
+
+        gl.clearColor(0,0,0,0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    }
+
+    render();
+
+    // ---------------- TOUCH SUPPORT ----------------
+    let dragging = false;
+    let last = {x:0, y:0};
+    let lastDist = 0;
+
+    function getTouches(e){
+        const rect = canvas.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+        const t = [];
+        for(let i=0;i<e.touches.length;i++){
+            t.push({
+                x:(e.touches[i].clientX-rect.left)*dpr,
+                y:(e.touches[i].clientY-rect.top)*dpr
+            });
+        }
+        return t;
+    }
+
+    canvas.addEventListener("touchstart", e=>{
+        e.preventDefault();
+        const t = getTouches(e);
+
+        if(t.length===1){
+            dragging=true;
+            last=t[0];
+        } 
+        else if(t.length===2){
+            dragging=false;
+            lastDist = Math.hypot(t[0].x-t[1].x, t[0].y-t[1].y);
+        }
+    });
+
+    canvas.addEventListener("touchmove", e=>{
+        e.preventDefault();
+        const t = getTouches(e);
+
+        if(t.length===1 && dragging){
+            const dx=t[0].x-last.x;
+            const dy=t[0].y-last.y;
+            center.x+=dx;
+            center.y+=dy;
+            last=t[0];
+            render();
+        }
+
+        if(t.length===2){
+            const dist = Math.hypot(t[0].x-t[1].x, t[0].y-t[1].y);
+            radius *= dist / lastDist;
+            lastDist = dist;
+            render();
+        }
+    });
+
+    canvas.addEventListener("touchend", e=>{
+        dragging=false;
+    });
+
+})();
+</script>
+
+</body>
+</html>

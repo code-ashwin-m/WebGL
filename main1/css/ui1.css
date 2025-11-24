@@ -1,0 +1,120 @@
+html, body {
+  margin: 0; padding: 0;
+  height: 100%;
+  background: #111;
+  font-family: system-ui;
+  color: #fff;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ------- TOP BAR ------- */
+#topbar {
+  height: 50px;
+  padding: 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: #000000aa;
+  backdrop-filter: blur(10px);
+}
+
+.icon-btn {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: white;
+}
+
+
+
+/* Workspace */
+#workspace {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+  
+  /*
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100vw;
+  height: 100vh;
+  transform: none !important;
+  */
+}
+#glCanvas {
+  width: 100%;
+  height: 100%;
+  /*background: #f00;
+  display: block;*/
+}
+
+/* Bottom Tool Bar */
+#bottomBar {
+  height: 60px;
+  background: #000000dd;
+  backdrop-filter: blur(10px);
+  display: flex;
+  align-items: center;
+  justify-content: space-evenly;
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.tool {
+  padding: 6px 12px;
+  background: #222;
+  border-radius: 12px;
+  font-size: 14px;
+}
+
+/* --- Popup Slider Panel --- */
+#sliderPopup {
+  position: absolute;
+  bottom: 60px;
+  left: 0;
+  right: 0;
+  max-height: 250px;
+  background: #000000f0;
+  backdrop-filter: blur(10px);
+  border-top: 1px solid #333;
+  transform: translateY(100%);
+  transition: transform 0.25s ease-out;
+  overflow: hidden;
+}
+
+#sliderPopup.open {
+  transform: translateY(0);
+}
+
+#sliderContent {
+  max-height: 250px;
+  overflow-y: auto;
+  padding: 15px;
+}
+
+/* Slider Row */
+.slider-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 18px;
+}
+
+.sliderLabel {
+  width: 40%;
+  font-size: 15px;
+}
+
+.sliderValue {
+  width: 20%;
+  text-align: right;
+}
+
+.sliderInput {
+  width: 40%;
+}

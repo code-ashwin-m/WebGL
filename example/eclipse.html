@@ -1,0 +1,247 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>WebGL Antialiased Circle Outline (5px white + 1px black)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html,body { height:100%; margin:0; background:#333; }
+    canvas { display:block; width:100%; height:100%; }
+    /* center the canvas area visually */
+    .info {
+      position: absolute;
+      left: 12px;
+      top: 12px;
+      color: white;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+      font-size: 13px;
+      background: rgba(0,0,0,0.35);
+      padding:6px 8px;
+      border-radius:6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="info">Antialiased circle — white outline 5px + black inner 1px (pixel-consistent)</div>
+  <canvas id="glcanvas"></canvas>
+
+<script id="vert" type="x-shader/x-vertex">
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main() {
+  v_uv = a_pos * 0.5 + 0.5;        // map clip-space (-1..1) to uv (0..1)
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}
+</script>
+
+<script id="frag" type="x-shader/x-fragment">
+precision highp float;
+varying vec2 v_uv;
+
+uniform vec2 u_resolution;   // canvas size in pixels
+uniform vec2 u_center;       // circle center in pixels
+uniform float u_radius;      // radius in pixels (centerline)
+uniform float u_white_th;    // white outline thickness in pixels
+uniform float u_black_th;    // black inner outline thickness in pixels
+uniform float u_feather;     // anti-aliasing feather in pixels
+
+// return a smooth mask for a ring centered at 'r_center' with thickness 'th'
+// d = distance from fragment to circle center (in pixels)
+float ringMask(float d, float r_center, float th, float feather) {
+    // inner and outer half positions:
+    float half = th * 0.5;
+    float inner = r_center - half;
+    float outer = r_center + half;
+
+    // Smoothstep for outer and inner edges; feather applied symmetrically
+    float outerEdge = smoothstep(outer + feather, outer - feather, d); // 1 inside outer edge
+    float innerEdge = smoothstep(inner - feather, inner + feather, d); // 1 outside inner edge
+    // ring = (inside outer) * (outside inner)
+    return outerEdge * innerEdge;
+}
+
+void main() {
+    // convert uv to pixel coords
+    vec2 p = v_uv * u_resolution;
+    float d = distance(p, u_center);
+
+    // feathers scaled (already in pixels)
+    float fe = max(0.5, u_feather);
+
+    // White ring centered at u_radius
+    float whiteMask = ringMask(d, u_radius, u_white_th, fe);
+
+    // Black ring placed just inside the inner edge of the white ring.
+    // Compute black ring center so it sits adjacent to the inner edge of white:
+    float white_half = u_white_th * 0.5;
+    float black_center = u_radius - white_half - (u_black_th * 0.5);
+    float blackMask = ringMask(d, black_center, u_black_th, fe);
+
+    // Colors
+    vec3 white = vec3(1.0);
+    vec3 black = vec3(0.0);
+
+    // Compose: black sits above white (so black visible near inner edge).
+    vec3 color = vec3(0.0, 0.0, 0.0); // transparent background shown as dark via page bg
+    float alpha = 0.0;
+
+    // We add layers: white then black on top.
+    // use max to combine alpha masks with correct layering (black overrides where present)
+    float whiteA = whiteMask;
+    float blackA = blackMask;
+
+    // final color/alpha
+    // black overlays white: where blackA > 0, use black; otherwise white; background transparent else.
+    alpha = max(whiteA, blackA);
+    vec3 col = mix(white, black, step(0.5, blackA)); // rough pick: if blackA exists, use black
+
+    // Better blending: if both present, black should show at its mask value,
+    // and white shows where whiteMask > blackMask.
+    // We'll compute as weighted blend:
+    float blackContrib = blackA;
+    float whiteContrib = max(0.0, whiteA - blackA); // white only where not covered by black
+    alpha = clamp(blackContrib + whiteContrib, 0.0, 1.0);
+    col = (black * blackContrib + white * whiteContrib) / max(alpha, 1e-6);
+
+    gl_FragColor = vec4(col, alpha);
+}
+</script>
+
+<script>
+// Helper: compile shader
+function createShader(gl, type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(s));
+    gl.deleteShader(s);
+    return null;
+  }
+  return s;
+}
+
+// Helper: create program
+function createProgram(gl, vsSrc, fsSrc) {
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    gl.deleteProgram(prog);
+    return null;
+  }
+  return prog;
+}
+
+(function main(){
+  const canvas = document.getElementById('glcanvas');
+  const gl = canvas.getContext('webgl', { antialias: false }); // we'll anti-alias in shader
+  if (!gl) {
+    alert('WebGL not supported');
+    return;
+  }
+
+  // get shader source
+  const vsSrc = document.getElementById('vert').textContent;
+  const fsSrc = document.getElementById('frag').textContent;
+  const program = createProgram(gl, vsSrc, fsSrc);
+  gl.useProgram(program);
+
+  // full-screen triangle strip quad (clip-space)
+  const posLoc = gl.getAttribLocation(program, 'a_pos');
+  const posBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+  // Two triangles covering clip-space
+  const verts = new Float32Array([
+    -1, -1,
+     1, -1,
+    -1,  1,
+     1,  1
+  ]);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Uniform locations
+  const u_resolution = gl.getUniformLocation(program, 'u_resolution');
+  const u_center = gl.getUniformLocation(program, 'u_center');
+  const u_radius = gl.getUniformLocation(program, 'u_radius');
+  const u_white_th = gl.getUniformLocation(program, 'u_white_th');
+  const u_black_th = gl.getUniformLocation(program, 'u_black_th');
+  const u_feather = gl.getUniformLocation(program, 'u_feather');
+
+  // resize handling (account for devicePixelRatio so stroke stays in physical pixels)
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = Math.max(1, Math.floor(canvas.clientWidth));
+    const cssH = Math.max(1, Math.floor(canvas.clientHeight));
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  // call resize initially and on window resize
+  function onResize() {
+    resize();
+    render();
+  }
+  window.addEventListener('resize', onResize, false);
+  // ensure canvas fills the window
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
+  resize();
+
+  // parameters (in pixels, physical device pixels)
+  function render() {
+    const dpr = window.devicePixelRatio || 1;
+    const res = [canvas.width, canvas.height];
+
+    // Circle center: center of canvas
+    const cx = res[0] * 0.5;
+    const cy = res[1] * 0.5;
+
+    // radius in pixels: use 0.28 * min dimension (in device pixels) so circle fits
+    const baseRadius = Math.min(res[0], res[1]) * 0.28;
+
+    // thickness in pixels (physical pixels). We want 5 px white outline and 1 px black outline.
+    const whitePx = 5.0 * dpr / dpr; // keep expressed in CSS pixels? Actually we want physical pixels -> use constant
+    // NOTE: whitePx and blackPx should be physical pixel widths. Since canvas.width is already in physical pixels,
+    // specifying thickness in pixels directly matches the canvas pixel grid. So:
+    const whiteThickness = 5.0; // px (on the canvas pixel grid)
+    const blackThickness = 1.0; // px
+
+    // anti-alias feather in pixels - keep around 1.0 (subpixel smoothing)
+    const feather = 1.0;
+
+    // Clear
+    gl.clearColor(0,0,0,0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
+    gl.useProgram(program);
+    gl.uniform2f(u_resolution, res[0], res[1]);
+    gl.uniform2f(u_center, cx, cy);
+    gl.uniform1f(u_radius, baseRadius);
+    gl.uniform1f(u_white_th, whiteThickness);
+    gl.uniform1f(u_black_th, blackThickness);
+    gl.uniform1f(u_feather, feather);
+
+    // draw full screen quad (two triangles, 4 verts)
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // initial render
+  render();
+
+  // Optional: let user click to change radius interactively (demonstration)
+  canvas.addEventListener('click', (e) => {
+    // optionally change radius depending on click Y (not required)
+    render();
+  });
+
+})();
+</script>
+</body>
+</html>

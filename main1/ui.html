@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Mobile View + UI</title>
+<link rel="stylesheet" href="css/main-ui.css">
+</head>
+<body>
+  <div id="app">
+
+    <header id="topbar">
+      <button class="icon-btn" id="backBtn">←</button>
+      <div class="title">Edit</div>
+      <button class="icon-btn" id="exportBtn">⤴</button>
+    </header>
+
+    <main id="workspace">
+      <canvas id="glCanvas"></canvas>
+      <div id="overlay"></div>
+    </main>
+
+    <section id="bottomPanel">
+
+      <div id="toolStrip">
+        <div class="tool" data-tool="light">Light</div>
+        <div class="tool" data-tool="color">Color</div>
+        <div class="tool" data-tool="effects">Effects</div>
+        <div class="tool" data-tool="detail">Detail</div>
+        <div class="tool" data-tool="crop">Crop</div>
+        <div class="tool" data-tool="mask">Mask</div>
+      </div>
+
+      <div id="toolOptions">
+        <!-- dynamically populated -->
+      </div>
+
+    </section>
+
+  </div>
+  <script src="js/main.js"></script> 
+</body>
+</html>
