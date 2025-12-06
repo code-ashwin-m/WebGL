@@ -65,7 +65,7 @@ export class UI {
       this.engine.setImage(img);
       this.resetViewToFit();
       this._addMask();
-      this._addMask();
+      // this._addMask();
       this.engine.draw();
     };
   }
